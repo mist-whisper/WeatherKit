@@ -116,14 +116,15 @@ export async function Response($request, $response) {
                                             break;
                                     }
                                 }
-                                // Overlay 第一步：AQ 只换数值，不换 scale 串。先把 AQ 表换成一张
-                                // 新表（category 4 / index 200，beta5 的测试值），其余槽位按
-                                // 原始字节保留在 opaque blob 里；失败则原样返回，不影响 CW。
-                                const aqOverlay = overlayWK3AQ(ByteBuffer, rawBody, parameters.country, 4, 200);
+                                // AQ 全套（欧标）：用原污染物按 EU_EAQI 算指数，一起换
+                                // category / index / 主污染物 / scale 串，昨日对比保持原值，
+                                // 污染物空了不补（先只做污染物本来就有的城市）；失败则
+                                // 原样返回，不影响 CW。
+                                const aqEU = calculateWK3AQEU(ByteBuffer, rawBody, parameters.country, Settings);
                                 let workingBody = rawBody;
                                 let workingByteBuffer = ByteBuffer;
-                                if (aqOverlay.body) {
-                                    workingBody = aqOverlay.body;
+                                if (aqEU.body) {
+                                    workingBody = aqEU.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
                                 const cwReplace = replaceWK3CWTemperature(workingByteBuffer, workingBody, parameters.country, Settings?.Weather?.Provider, providerCurrentWeather);
@@ -139,7 +140,7 @@ export async function Response($request, $response) {
                                     `dataSets: ${parameters.dataSets.join(",")}`,
                                     `country: ${parameters.country}`,
                                     ...slotLines,
-                                    aqOverlay.log,
+                                    aqEU.log,
                                     cwReplace.log,
                                 );
                                 break;
@@ -259,9 +260,105 @@ export async function Response($request, $response) {
  * @param {number} newIndex - 测试用 index（beta5 同款 200）
  * @returns {{body: Uint8Array | null, log: string}}
  */
-function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex) {
+/**
+ * WK3 AQ 欧标全套：用原污染物按 EU_EAQI 算指数，一起换 category /
+ * index / 主污染物 / scale 串，昨日对比保持原值，污染物空了不补
+ * （先只做污染物本来就有的城市），元数据与污染物向量保持原样。
+ * 解码沿用 WK2 的 AQ / 污染物字段顺序（已在北京、东京两体上核对：
+ * AQ 字段1 category、字段2 index、字段7 scale；污染物字段0 类型、
+ * 字段1 浓度、字段2 单位）。注意：不跑 FixPollutantsUnits，因为
+ * 苹果原污染物已是 WeatherKit 单位，Fix 只针对插件自己注入的
+ * 和风污染物；对原数据跑 Fix 会把 CO 从 µg 误当 mg 再乘 1000。
+ * 计算强制用 EU_EAQI（不跟随用户 Settings 的算法设置），因为
+ * 本次实验的约定就是先算欧标；污染物类型 / 单位枚举沿用 WK2，
+ * 单位字节 2（WK2 里叫 UNKNOWN2）在计算里按原量处理——
+ * ConvertUnit 不支持它时会原样返回，浓度本身已是 µg 量级，
+ * 指数计算不受影响。任一校验失败都原样返回。
+ * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
+ * @param {Uint8Array} rawBody - 原始包体
+ * @param {string} country - 请求的 country 参数
+ * @param {any} Settings - 插件 Settings（仅取其余配置，算法强制 EU_EAQI）
+ * @returns {{body: Uint8Array | null, log: string}}
+ */
+function calculateWK3AQEU(ByteBuffer, rawBody, country, Settings) {
+    try {
+        if (country !== "CN") return { body: null, log: "WK3 aqEU: skipped (country != CN)" };
+        const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
+        if (rootPos < 0 || rootPos + 4 > rawBody.length) return { body: null, log: "WK3 aqEU: skipped (root out of range)" };
+        const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
+        const rootFieldCount = Math.floor((ByteBuffer.readUint16(rootVtablePos) - 4) / 2);
+        if (rootFieldCount !== 15) return { body: null, log: `WK3 aqEU: skipped (unexpected root fields=${rootFieldCount})` };
+        const slot0Offset = ByteBuffer.__offset(rootPos, 4);
+        if (!slot0Offset) return { body: null, log: "WK3 aqEU: skipped (slot 0 absent)" };
+        const aqPos = ByteBuffer.__indirect(rootPos + slot0Offset);
+        const aqMetaOffset = ByteBuffer.__offset(aqPos, 4);
+        const aqCategoryOffset = ByteBuffer.__offset(aqPos, 6);
+        const aqIndexOffset = ByteBuffer.__offset(aqPos, 8);
+        const aqPollutantsOffset = ByteBuffer.__offset(aqPos, 12);
+        const aqScaleOffset = ByteBuffer.__offset(aqPos, 18);
+        if (!aqMetaOffset || !aqCategoryOffset || !aqIndexOffset || !aqPollutantsOffset || !aqScaleOffset) {
+            return { body: null, log: "WK3 aqEU: skipped (AQ field absent)" };
+        }
+        const oldScale = ByteBuffer.__string(aqPos + aqScaleOffset);
+        if (!AirQuality.ScaleMatches(oldScale, "HJ6332012")) {
+            return { body: null, log: `WK3 aqEU: skipped (scale mismatch: ${oldScale})` };
+        }
+        const oldCategory = ByteBuffer.readInt8(aqPos + aqCategoryOffset);
+        const oldIndex = ByteBuffer.readInt16(aqPos + aqIndexOffset);
+        const metaPos = ByteBuffer.__indirect(aqPos + aqMetaOffset);
+        const metaProviderOffset = ByteBuffer.__offset(metaPos, 16);
+        const providerName = metaProviderOffset ? ByteBuffer.__string(metaPos + metaProviderOffset) : "";
+        const vecPos = ByteBuffer.__indirect(aqPos + aqPollutantsOffset);
+        if (vecPos < 0 || vecPos + 4 > rawBody.length) return { body: null, log: "WK3 aqEU: skipped (pollutants vector out of range)" };
+        const vecLen = ByteBuffer.readInt32(vecPos);
+        if (vecLen <= 0 || vecLen > 20) return { body: null, log: `WK3 aqEU: skipped (pollutants empty or too many: ${vecLen})` };
+        const pollutantTypes = ["NOT_AVAILABLE", "C6H6", "NH3", "NMHC", "NO", "NO2", "NOX", "OZONE", "PM2_5", "SO2", "PM10", "CO", "UNKNOWN12", "UNKNOWN13"];
+        const unitTypes = ["PARTS_PER_BILLION", "MICROGRAMS_PER_CUBIC_METER", "UNKNOWN2", "UNKNOWN3"];
+        const pollutants = [];
+        for (let i = 0; i < vecLen; i++) {
+            const elemPos = ByteBuffer.__indirect(vecPos + 4 + i * 4);
+            const typeOffset = ByteBuffer.__offset(elemPos, 4);
+            const amountOffset = ByteBuffer.__offset(elemPos, 6);
+            const unitsOffset = ByteBuffer.__offset(elemPos, 8);
+            if (!typeOffset || !amountOffset || !unitsOffset) return { body: null, log: `WK3 aqEU: skipped (pollutant ${i} field absent)` };
+            const typeByte = ByteBuffer.readInt8(elemPos + typeOffset);
+            const amount = ByteBuffer.readFloat32(elemPos + amountOffset);
+            const unitsByte = ByteBuffer.readInt8(elemPos + unitsOffset);
+            if (!Number.isFinite(amount) || amount < 0) return { body: null, log: `WK3 aqEU: skipped (pollutant ${i} amount invalid)` };
+            pollutants.push({ pollutantType: pollutantTypes[typeByte] ?? "UNKNOWN", amount, units: unitTypes[unitsByte] ?? "UNKNOWN" });
+        }
+        const forcedSettings = {
+            ...Settings,
+            AirQuality: { ...(Settings?.AirQuality ?? {}), Calculate: { ...(Settings?.AirQuality?.Calculate ?? {}), Algorithm: "EU_EAQI" } },
+        };
+        const calculated = AirQuality.Pollutants2AQI({ pollutants, metadata: { providerName } }, forcedSettings);
+        if (!Number.isFinite(calculated?.index) || calculated.index < 0 || !Number.isFinite(calculated?.categoryIndex) || calculated.categoryIndex < 1 || calculated.categoryIndex > 6) {
+            return { body: null, log: `WK3 aqEU: skipped (calculation invalid: index=${calculated?.index} category=${calculated?.categoryIndex})` };
+        }
+        const primaryEnum = pollutantTypes.indexOf(calculated.primaryPollutant);
+        if (primaryEnum < 0) return { body: null, log: `WK3 aqEU: skipped (primary pollutant unknown: ${calculated.primaryPollutant})` };
+        const perPollutant = (calculated.pollutants ?? []).map(p => `${p.pollutantType}=${Number.isFinite(p.index) ? p.index.toFixed(2) : p.index}`).join(" ");
+        const overlay = overlayWK3AQ(ByteBuffer, rawBody, country, calculated.categoryIndex, Math.round(calculated.index), {
+            scale: calculated.scale,
+            primaryEnum,
+            isSignificant: calculated.isSignificant,
+        });
+        if (!overlay.body) return { body: null, log: `WK3 aqEU: overlay failed (${overlay.log})` };
+        return {
+            body: overlay.body,
+            log: `WK3 aqEU: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${calculated.scale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (EU_EAQI, comparison unchanged)`,
+        };
+    } catch (error) {
+        return { body: null, log: `WK3 aqEU: skipped (${error?.message ?? error})` };
+    }
+}
+
+function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, options = {}) {
     try {
         if (country !== "CN") return { body: null, log: "WK3 aqOverlay: skipped (country != CN)" };
+        // options.scale：不传或与原 scale 相同则 scale 串指向 blob 原串；
+        // 传新串则在新 AQ 表后新建一个字符串对象，scale 字段指向它。
+        // options.primaryEnum / options.isSignificant：不传则保持原字节。
         const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
         if (rootPos < 0 || rootPos + 4 > rawBody.length) return { body: null, log: "WK3 aqOverlay: skipped (root out of range)" };
         const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
@@ -290,9 +387,10 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex) {
             return { body: null, log: "WK3 aqOverlay: skipped (AQ field absent)" };
         }
         const scale = ByteBuffer.__string(aqPos + aqScaleOffset);
-        if (scale !== "HJ6332012.2604") {
+        if (!AirQuality.ScaleMatches(scale, "HJ6332012")) {
             return { body: null, log: `WK3 aqOverlay: skipped (scale mismatch: ${scale})` };
         }
+        const newScale = typeof options.scale === "string" && options.scale.length > 0 ? options.scale : scale;
         const oldCategory = ByteBuffer.readInt8(aqPos + aqCategoryOffset);
         const oldIndex = ByteBuffer.readInt16(aqPos + aqIndexOffset);
         // 原有在场槽位清单（自检用）。
@@ -306,7 +404,11 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex) {
         const newRootPos = align4(newRootVtablePos + rootVtableLen);
         const newAqVtablePos = align4(newRootPos + rootTableSize);
         const newAqPos = newAqVtablePos + aqVtableLen;
-        const blobOffset = align8(newAqPos + aqTableSize);
+        const scaleChanged = newScale !== scale;
+        const newScaleBytes = scaleChanged ? new TextEncoder().encode(newScale) : null;
+        const newScalePos = scaleChanged ? align4(newAqPos + aqTableSize) : null;
+        const newScaleSize = scaleChanged ? align4(4 + newScaleBytes.length) : 0;
+        const blobOffset = align8((scaleChanged ? newScalePos + newScaleSize : newAqPos + aqTableSize));
         const out = new Uint8Array(blobOffset + rawBody.length);
         const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
         view.setUint32(0, newRootPos, true);
@@ -326,13 +428,32 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex) {
         const newAq = new Uint8Array(rawBody.subarray(aqPos, aqPos + aqTableSize));
         const newAqView = new DataView(newAq.buffer, newAq.byteOffset, newAq.byteLength);
         newAqView.setInt32(0, newAqPos - newAqVtablePos, true);
-        for (const fieldOffset of [aqMetaOffset, aqPollutantsOffset, aqScaleOffset]) {
+        for (const fieldOffset of [aqMetaOffset, aqPollutantsOffset]) {
             const origTarget = ByteBuffer.__indirect(aqPos + fieldOffset);
             newAqView.setUint32(fieldOffset, origTarget + blobOffset - (newAqPos + fieldOffset), true);
         }
+        if (scaleChanged) {
+            newAqView.setUint32(aqScaleOffset, newScalePos - (newAqPos + aqScaleOffset), true);
+        } else {
+            const origTarget = ByteBuffer.__indirect(aqPos + aqScaleOffset);
+            newAqView.setUint32(aqScaleOffset, origTarget + blobOffset - (newAqPos + aqScaleOffset), true);
+        }
         newAqView.setInt8(aqCategoryOffset, newCategory);
         newAqView.setInt16(aqIndexOffset, newIndex, true);
+        const aqIsSignificantOffset = ByteBuffer.__offset(aqPos, 10);
+        if (aqIsSignificantOffset && typeof options.isSignificant === "boolean") {
+            newAqView.setInt8(aqIsSignificantOffset, options.isSignificant ? 1 : 0);
+        }
+        const aqPrimaryOffset = ByteBuffer.__offset(aqPos, 16);
+        if (aqPrimaryOffset && Number.isInteger(options.primaryEnum)) {
+            newAqView.setInt8(aqPrimaryOffset, options.primaryEnum);
+        }
         out.set(newAq, newAqPos);
+        if (scaleChanged) {
+            const scaleView = new DataView(out.buffer, out.byteOffset, out.byteLength);
+            scaleView.setUint32(newScalePos, newScaleBytes.length, true);
+            out.set(newScaleBytes, newScalePos + 4);
+        }
         out.set(rawBody, blobOffset);
         // 自检：重建 ByteBuffer 核对关键项。
         const checkBuffer = new flatbuffers.ByteBuffer(out);
@@ -350,10 +471,10 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex) {
         if (checkBuffer.readInt16(checkAqPos + checkBuffer.__offset(checkAqPos, 8)) !== newIndex) {
             return { body: null, log: "WK3 aqOverlay: skipped (self-check index mismatch)" };
         }
-        if (checkBuffer.__string(checkAqPos + checkBuffer.__offset(checkAqPos, 18)) !== scale) {
+        if (checkBuffer.__string(checkAqPos + checkBuffer.__offset(checkAqPos, 18)) !== newScale) {
             return { body: null, log: "WK3 aqOverlay: skipped (self-check scale mismatch)" };
         }
-        return { body: out, log: `WK3 aqOverlay: scale unchanged, category ${oldCategory}->${newCategory} index ${oldIndex}->${newIndex} (overlay, opaque slots preserved) body ${rawBody.length}->${out.length}` };
+        return { body: out, log: `WK3 aqOverlay: scale ${scale}->${newScale}, category ${oldCategory}->${newCategory} index ${oldIndex}->${newIndex} (overlay, opaque slots preserved) body ${rawBody.length}->${out.length}` };
     } catch (error) {
         return { body: null, log: `WK3 aqOverlay: skipped (${error?.message ?? error})` };
     }
