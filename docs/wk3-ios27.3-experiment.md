@@ -185,3 +185,21 @@ Authorization 令牌。本页只保留了脱敏后的 URL、响应头名和包�
   （9.50 / 8.00 / 5.20）与 ColorfulClouds 式（9.50 / 8.00、无露点→
   Magnus 得 3.47）均长度不变、仅 WK3 cw 一行变化；第三方为空与
   JP 对照正确跳过并原样返回。
+
+## AQ 根表 overlay（2026-11-04，beta7 之后，待发 beta8）
+
+- 不再原位改 AQ 表：新根表（15 槽、vtable 原样复制）只换槽位 0
+  为一张新 AQ 表（category 4 / index 200，beta5 的测试值），其余
+  槽位按原始字节保留在 opaque blob 里，不需要先认清未知槽位
+  的内部 schema（PR #69 的 copy-on-write 思路）。
+- 新 AQ 表的 3 个偏移字段（元数据、污染物向量、scale 串）重算
+  指向 blob；首要污染物字段经表字节核实为 1 字节枚举、不是偏移，
+  绝不重算（第一版误按偏移重算会污染污染物向量，已修正）。
+- 只在 country 为 CN 且 scale 串为 HJ6332012.2604 时换；自检用新
+  包体重建 ByteBuffer，核对根表字段数、在场槽位、slot0 的
+  category / index / scale，任一不符即原样返回。
+- 离线验证：JS 版 overlay 输出与 Python 版在北京包体上逐字节
+  相同（49932 字节）；全槽位 dump 对比除 AQ 数值外全部一致；
+  东京包体强制 CN 下因 scale 不符正确跳过，JP 对照与空根表
+  正确跳过。当前天气真实温度替换仍在 overlay 后的包体上原位做，
+  两者互不干扰。

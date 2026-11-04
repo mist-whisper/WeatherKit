@@ -116,8 +116,19 @@ export async function Response($request, $response) {
                                             break;
                                     }
                                 }
-                                const cwReplace = replaceWK3CWTemperature(ByteBuffer, rawBody, parameters.country, Settings?.Weather?.Provider, providerCurrentWeather);
-                                if (cwReplace.body) rawBody = cwReplace.body;
+                                // Overlay 第一步：AQ 只换数值，不换 scale 串。先把 AQ 表换成一张
+                                // 新表（category 4 / index 200，beta5 的测试值），其余槽位按
+                                // 原始字节保留在 opaque blob 里；失败则原样返回，不影响 CW。
+                                const aqOverlay = overlayWK3AQ(ByteBuffer, rawBody, parameters.country, 4, 200);
+                                let workingBody = rawBody;
+                                let workingByteBuffer = ByteBuffer;
+                                if (aqOverlay.body) {
+                                    workingBody = aqOverlay.body;
+                                    workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
+                                }
+                                const cwReplace = replaceWK3CWTemperature(workingByteBuffer, workingBody, parameters.country, Settings?.Weather?.Provider, providerCurrentWeather);
+                                if (cwReplace.body) workingBody = cwReplace.body;
+                                rawBody = workingBody;
                                 Console.warn(
                                     "WK3 weather response (experiment, not a fix) [cwReplace: CW real provider temperature, all other bytes unchanged, fail -> original]",
                                     `messageType: ${$response.headers?.["Content-Type"] ?? $response.headers?.["content-type"]}`,
@@ -128,6 +139,7 @@ export async function Response($request, $response) {
                                     `dataSets: ${parameters.dataSets.join(",")}`,
                                     `country: ${parameters.country}`,
                                     ...slotLines,
+                                    aqOverlay.log,
                                     cwReplace.log,
                                 );
                                 break;
@@ -225,6 +237,128 @@ export async function Response($request, $response) {
  * @param {any} providerCurrentWeather - 第三方当前天气对象，未查到时为 null
  * @returns {{body: Uint8Array | null, log: string}}
  */
+/**
+ * WK3 根表 overlay（AQ 第一步，测试值）：把 AQ 表换成一张新表，其余槽位
+ * 按原始字节保留，不需要先认清未知槽位的内部 schema（PR #69 的
+ * copy-on-write 思路，离线已在北京、东京两体上验证通过）。
+ * 新包体布局：[新根表 uoffset][新根表 vtable][新根表][新 AQ vtable]
+ * [新 AQ 表][原始包体 verbatim（8 字节对齐的 opaque blob）]。
+ * 新根表除 slot0 外的每个字段都重算指向 blob 内的原表；新 AQ 表的
+ * 3 个偏移字段（元数据、污染物向量、scale 串）也重算指向 blob，
+ * 首要污染物字段经表字节核实为 1 字节枚举、不是偏移，绝不重算。
+ * AQ 内部字段身份沿用 WK2（字段1 category int8、字段2 index int16、
+ * 字段7 scale 字符串），且要求 scale 串为 HJ6332012.2604 才换；
+ * 任一校验失败都原样返回（body 为 null），绝不输出半成品包体。
+ * 自检：用新包体重建 ByteBuffer，核对根表字段数、slot0 的
+ * category / index / scale、以及原有在场槽位仍在场，任一不符
+ * 即放弃 overlay、原样返回。
+ * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
+ * @param {Uint8Array} rawBody - 原始包体
+ * @param {string} country - 请求的 country 参数
+ * @param {number} newCategory - 测试用 category（beta5 同款 4）
+ * @param {number} newIndex - 测试用 index（beta5 同款 200）
+ * @returns {{body: Uint8Array | null, log: string}}
+ */
+function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex) {
+    try {
+        if (country !== "CN") return { body: null, log: "WK3 aqOverlay: skipped (country != CN)" };
+        const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
+        if (rootPos < 0 || rootPos + 4 > rawBody.length) return { body: null, log: "WK3 aqOverlay: skipped (root out of range)" };
+        const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
+        const rootVtableLen = ByteBuffer.readUint16(rootVtablePos);
+        const rootTableSize = ByteBuffer.readUint16(rootVtablePos + 2);
+        const rootFieldCount = Math.floor((rootVtableLen - 4) / 2);
+        if (rootFieldCount !== 15 || rootTableSize <= 0 || rootTableSize > 1024) {
+            return { body: null, log: `WK3 aqOverlay: skipped (unexpected root fields=${rootFieldCount} size=${rootTableSize})` };
+        }
+        const slot0Offset = ByteBuffer.__offset(rootPos, 4);
+        if (!slot0Offset) return { body: null, log: "WK3 aqOverlay: skipped (slot 0 absent)" };
+        const aqPos = ByteBuffer.__indirect(rootPos + slot0Offset);
+        const aqVtablePos = aqPos - ByteBuffer.readInt32(aqPos);
+        const aqVtableLen = ByteBuffer.readUint16(aqVtablePos);
+        const aqTableSize = ByteBuffer.readUint16(aqVtablePos + 2);
+        const aqFieldCount = Math.floor((aqVtableLen - 4) / 2);
+        if (aqFieldCount < 8 || aqTableSize <= 0 || aqTableSize > 1024) {
+            return { body: null, log: `WK3 aqOverlay: skipped (unexpected AQ fields=${aqFieldCount} size=${aqTableSize})` };
+        }
+        const aqMetaOffset = ByteBuffer.__offset(aqPos, 4);
+        const aqCategoryOffset = ByteBuffer.__offset(aqPos, 6);
+        const aqIndexOffset = ByteBuffer.__offset(aqPos, 8);
+        const aqPollutantsOffset = ByteBuffer.__offset(aqPos, 12);
+        const aqScaleOffset = ByteBuffer.__offset(aqPos, 18);
+        if (!aqMetaOffset || !aqCategoryOffset || !aqIndexOffset || !aqPollutantsOffset || !aqScaleOffset) {
+            return { body: null, log: "WK3 aqOverlay: skipped (AQ field absent)" };
+        }
+        const scale = ByteBuffer.__string(aqPos + aqScaleOffset);
+        if (scale !== "HJ6332012.2604") {
+            return { body: null, log: `WK3 aqOverlay: skipped (scale mismatch: ${scale})` };
+        }
+        const oldCategory = ByteBuffer.readInt8(aqPos + aqCategoryOffset);
+        const oldIndex = ByteBuffer.readInt16(aqPos + aqIndexOffset);
+        // 原有在场槽位清单（自检用）。
+        const presentSlots = [];
+        for (let slot = 0; slot < rootFieldCount; slot++) {
+            if (ByteBuffer.__offset(rootPos, 4 + slot * 2)) presentSlots.push(slot);
+        }
+        const align4 = value => Math.ceil(value / 4) * 4;
+        const align8 = value => Math.ceil(value / 8) * 8;
+        const newRootVtablePos = 4;
+        const newRootPos = align4(newRootVtablePos + rootVtableLen);
+        const newAqVtablePos = align4(newRootPos + rootTableSize);
+        const newAqPos = newAqVtablePos + aqVtableLen;
+        const blobOffset = align8(newAqPos + aqTableSize);
+        const out = new Uint8Array(blobOffset + rawBody.length);
+        const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+        view.setUint32(0, newRootPos, true);
+        out.set(rawBody.subarray(rootVtablePos, rootVtablePos + rootVtableLen), newRootVtablePos);
+        const newRoot = new Uint8Array(rawBody.subarray(rootPos, rootPos + rootTableSize));
+        const newRootView = new DataView(newRoot.buffer, newRoot.byteOffset, newRoot.byteLength);
+        newRootView.setInt32(0, newRootPos - newRootVtablePos, true);
+        for (let slot = 0; slot < rootFieldCount; slot++) {
+            const fieldOffset = ByteBuffer.__offset(rootPos, 4 + slot * 2);
+            if (!fieldOffset) continue;
+            const newFieldPos = newRootPos + fieldOffset;
+            const value = slot === 0 ? newAqPos - newFieldPos : ByteBuffer.__indirect(rootPos + fieldOffset) + blobOffset - newFieldPos;
+            newRootView.setUint32(fieldOffset, value, true);
+        }
+        out.set(newRoot, newRootPos);
+        out.set(rawBody.subarray(aqVtablePos, aqVtablePos + aqVtableLen), newAqVtablePos);
+        const newAq = new Uint8Array(rawBody.subarray(aqPos, aqPos + aqTableSize));
+        const newAqView = new DataView(newAq.buffer, newAq.byteOffset, newAq.byteLength);
+        newAqView.setInt32(0, newAqPos - newAqVtablePos, true);
+        for (const fieldOffset of [aqMetaOffset, aqPollutantsOffset, aqScaleOffset]) {
+            const origTarget = ByteBuffer.__indirect(aqPos + fieldOffset);
+            newAqView.setUint32(fieldOffset, origTarget + blobOffset - (newAqPos + fieldOffset), true);
+        }
+        newAqView.setInt8(aqCategoryOffset, newCategory);
+        newAqView.setInt16(aqIndexOffset, newIndex, true);
+        out.set(newAq, newAqPos);
+        out.set(rawBody, blobOffset);
+        // 自检：重建 ByteBuffer 核对关键项。
+        const checkBuffer = new flatbuffers.ByteBuffer(out);
+        const checkRootPos = checkBuffer.readInt32(checkBuffer.position()) + checkBuffer.position();
+        const checkRootVtablePos = checkRootPos - checkBuffer.readInt32(checkRootPos);
+        const checkFieldCount = Math.floor((checkBuffer.readUint16(checkRootVtablePos) - 4) / 2);
+        if (checkFieldCount !== rootFieldCount) return { body: null, log: "WK3 aqOverlay: skipped (self-check root field count mismatch)" };
+        for (const slot of presentSlots) {
+            if (!checkBuffer.__offset(checkRootPos, 4 + slot * 2)) return { body: null, log: `WK3 aqOverlay: skipped (self-check slot ${slot} lost)` };
+        }
+        const checkAqPos = checkBuffer.__indirect(checkRootPos + checkBuffer.__offset(checkRootPos, 4));
+        if (checkBuffer.readInt8(checkAqPos + checkBuffer.__offset(checkAqPos, 6)) !== newCategory) {
+            return { body: null, log: "WK3 aqOverlay: skipped (self-check category mismatch)" };
+        }
+        if (checkBuffer.readInt16(checkAqPos + checkBuffer.__offset(checkAqPos, 8)) !== newIndex) {
+            return { body: null, log: "WK3 aqOverlay: skipped (self-check index mismatch)" };
+        }
+        if (checkBuffer.__string(checkAqPos + checkBuffer.__offset(checkAqPos, 18)) !== scale) {
+            return { body: null, log: "WK3 aqOverlay: skipped (self-check scale mismatch)" };
+        }
+        return { body: out, log: `WK3 aqOverlay: scale unchanged, category ${oldCategory}->${newCategory} index ${oldIndex}->${newIndex} (overlay, opaque slots preserved) body ${rawBody.length}->${out.length}` };
+    } catch (error) {
+        return { body: null, log: `WK3 aqOverlay: skipped (${error?.message ?? error})` };
+    }
+}
+
 function replaceWK3CWTemperature(ByteBuffer, rawBody, country, providerName, providerCurrentWeather) {
     try {
         if (country !== "CN") return { body: null, log: "WK3 cwReplace: skipped (country != CN)" };

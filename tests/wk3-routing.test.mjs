@@ -58,6 +58,20 @@ test("CW 真实温度原位替换：第三方温度 / 体感 / 露点，Colorful
     assert.doesNotMatch(v3Block, /WeatherKit2\.decode|WeatherKit2\.encode/);
 });
 
+test("AQ overlay：新 AQ 表 + 其余槽位 opaque 保留，失败原样返回，不走 WK2 解码", () => {
+    assert.match(response, /function overlayWK3AQ/);
+    assert.match(response, /WK3 aqOverlay: scale unchanged/);
+    assert.match(response, /opaque slots preserved/);
+    assert.match(response, /self-check/);
+    assert.doesNotMatch(response, /TEST\.WK3\.00001/);
+    // v3 分支内不得出现 WK2 解码/编码，也不得写 $response.body。
+    const v3Start = response.indexOf('startsWith("/api/v3/weather/")');
+    const v2Start = response.indexOf('startsWith("/api/v2/weather/")', v3Start);
+    const v3Block = response.slice(v3Start, v2Start);
+    assert.doesNotMatch(v3Block, /WeatherKit2\.decode|WeatherKit2\.encode/);
+    assert.doesNotMatch(v3Block, /\$response\.body\s*=/);
+});
+
 test("Request 对 v3 沿用 v2 的 country 补齐分支", () => {
     assert.match(request, /startsWith\("\/api\/v3\/weather\/"\)/);
 });
