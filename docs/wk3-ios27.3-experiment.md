@@ -71,3 +71,15 @@
 不要把原始抓包 zip 原样提交到任何公开仓库或 Issue：它含 weatherkit 的
 Authorization 令牌。本页只保留了脱敏后的 URL、响应头名和包体归因字串，
 没有复制任何令牌、请求 ID 或 clientMetadata。
+
+## Fork-only 补充（2026-11-04，预发布 v3.3.3-beta1 用）
+
+- 本分支后来又加了一个 fork-only 提交：把 4 个主模板（Loon、Surge、Stash、Quantumult X）
+  里的 script-path / script url 从 `github.com/NSRingo/WeatherKit/releases/download/` 改成
+  `github.com/mist-whisper/WeatherKit/releases/download/`。不改这一步，fork 打出的 `.lpx`
+  仍会去拉上游的旧 bundle，v3 探针跑不起来。
+- 这个改动只属于 fork，往上游提 PR 时必须剔除；dev 模板（指向 VirgilClyne 的 gist）
+  和 Rewrite 模板（指向 weatherkit.pages.dev）不在此次改动范围内。
+- 预发布 tag 为 `v3.3.3-beta1`，触发上游同款 pre-release.yml：构建后把 `dist/*` 作为
+  预发布附件发布，不设为 latest。构建仍需 fork 里补好 PACKAGE_TOKEN / SUBMODULE_TOKEN，
+  否则 npm install / checkout 会失败。

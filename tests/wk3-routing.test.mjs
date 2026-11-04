@@ -26,6 +26,11 @@ test("Request 对 v3 沿用 v2 的 country 补齐分支", () => {
     assert.match(request, /startsWith\("\/api\/v3\/weather\/"\)/);
 });
 
+test("Fork-only: Loon 模板的 script-path 指向 fork 的 Release（上游化时须剔除）", () => {
+    assert.match(loon, /github\.com\/mist-whisper\/WeatherKit\/releases\/download/);
+    assert.doesNotMatch(loon, /github\.com\/NSRingo\/WeatherKit\/releases\/download/);
+});
+
 test("parseWeatherKitURL 对 availability / weather 接受 v3", () => {
     assert.match(parse, /v1\|v2\|v3/);
 });
