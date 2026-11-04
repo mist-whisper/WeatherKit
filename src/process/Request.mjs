@@ -99,16 +99,19 @@ export async function Request($request) {
                         }
                         default:
                             switch (true) {
-                                case url.pathname.startsWith("/api/v1/airQualityScale/"): {
+                                case url.pathname.includes("/airQualityScale/"): {
                                     const { version, language } = parameters;
                                     const scaleName = parameters.scale?.replace(/\.\d+$/, "");
                                     if (version && language && scaleName) {
-                                        url.pathname = `/api/${version}/airQualityScale/${language}/${scaleName}`;
-                                        switch (url.pathname) {
-                                            case `/api/v1/airQualityScale/${language}/HK.AQHI`:
-                                            case `/api/v1/airQualityScale/${language}/CN.AQHI`:
-                                                $response = new AirQualityScale().Build(language, scaleName);
-                                                break;
+                                        // WK3 探针：定义请求可能走 v1 也可能走 v3（此前规则与解析只认 v1，
+                                        // 且处理按改写后的 v1 路径匹配，v3 即使放行也会错过），故按 scale 名
+                                        // 直接匹配本地合成，不再依赖改写后的路径；命中与否都打日志，装机即诊断。
+                                        if (scaleName === "HK.AQHI" || scaleName === "CN.AQHI") {
+                                            $response = new AirQualityScale().Build(language, scaleName);
+                                            Console.info(`WK3 scale: ${url.pathname} -> local ${scaleName} (${$response ? "hit" : "miss"})`);
+                                            if (!$response) url.pathname = `/api/${version}/airQualityScale/${language}/${scaleName}`;
+                                        } else {
+                                            url.pathname = `/api/${version}/airQualityScale/${language}/${scaleName}`;
                                         }
                                     }
                                     break;
