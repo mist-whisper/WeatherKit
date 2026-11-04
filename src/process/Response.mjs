@@ -378,8 +378,13 @@ function calculateWK3AQ(ByteBuffer, rawBody, country, Settings) {
             const unitLabel = p.unitsEnum === 0 ? "ppb" : p.unitsEnum === 1 ? "µg" : `byte${p.unitsEnum}`;
             return `${pollutantTypes[orig.typeByte] ?? "?"} ${orig.amount}->${Number(p.amount.toFixed(2))}${unitLabel}`;
         }).filter(Boolean).join(", ");
+        // WK3 探针（beta12）：beta11 已证实应用不发定义请求，故“定义送达”说已排除；
+        // 剩余名字格式假说：WK3 体内苹果自带 scale 均带版本后缀（HJ6332012.2604、
+        // EPA_NowCast.2604），而 HK.AQHI 本地定义的 version 为 1，故试写带版本的
+        // HK.AQHI.1；其余标准不动。CN.AQHI 同理但本探针只动 HK 代表。
+        const probeScale = calculated.scale === "HK.AQHI" ? "HK.AQHI.1" : calculated.scale;
         const overlay = overlayWK3AQ(ByteBuffer, rawBody, country, calculated.categoryIndex, Math.round(calculated.index), {
-            scale: calculated.scale,
+            scale: probeScale,
             primaryEnum,
             isSignificant: calculated.isSignificant,
             pollutants: newPollutants,
@@ -387,7 +392,7 @@ function calculateWK3AQ(ByteBuffer, rawBody, country, Settings) {
         if (!overlay.body) return { body: null, log: `WK3 aq: overlay failed (${overlay.log})` };
         return {
             body: overlay.body,
-            log: `WK3 aq: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${calculated.scale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (comparison unchanged, pollutants vector rebuilt: ${changedDesc || "no changes"})`,
+            log: `WK3 aq: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${probeScale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (comparison unchanged, pollutants vector rebuilt: ${changedDesc || "no changes"})`,
         };
     } catch (error) {
         return { body: null, log: `WK3 aq: skipped (${error?.message ?? error})` };
