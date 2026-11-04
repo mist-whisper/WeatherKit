@@ -95,7 +95,7 @@ export async function Response($request, $response) {
                                 const parameters = parseWeatherKitURL(url);
                                 const slotLines = dumpWK3Root(ByteBuffer, rawBody.length);
                                 Console.warn(
-                                    "WK3 weather response passthrough (experiment, not a fix) [probe v2: log only, body unchanged]",
+                                    "WK3 weather response passthrough (experiment, not a fix) [probe v3: log only, body unchanged]",
                                     `messageType: ${$response.headers?.["Content-Type"] ?? $response.headers?.["content-type"]}`,
                                     // v1 探针读响应头得到 undefined 是取错了地方：schema 版本在请求头里，
                                     // 响应头里没有这个字段，所以 v2 两边都记，互相对照。
@@ -178,25 +178,105 @@ export async function Response($request, $response) {
 }
 
 /**
- * WK3 实验探针 v2：只读根表槽位清单，不解码、不重编码、不改包体。
- * 只用 FlatBuffer 的 vtable 读槽位在不在、子表字段数、子表直接字符串字段；
- * 不调用 WeatherKit2.decode / encode，不写 $response.body，失败时只记一行错误就透传。
- * 子表字符串只取直接字段（如 AirQuality 的 scale、Alerts 的 detailsUrl），不递归展开；
- * 向量长度不通用推断，避免把标量字段误读成向量长度，只靠字段数与字符串锚定认槽位。
+ * WK3 实验探针 v3：只读，不解码、不重编码、不改包体。
+ * 在 v2 的根表槽位清单基础上新增三类只读信息，全部带越界与合理性校验，
+ * 任一读数失败只跳过该项，绝不影响透传：
+ * - 2 字段包装表：字段1 的向量长度与首元素表字段数（区分每日/小时/历史对比等）；
+ * - 空气质量 slot0：category / index；当前天气 slot1：asOf / humidity / pressure
+ *   与候选温度字段 f25 / f26 / f27 / f31 / f32 的浮点值（温度字段尚未最终证实，
+ *   日志里只记数值、不下结论）；
+ * - 下一小时 slot5：forecastStart / forecastEnd 与 minutes 向量长度；
+ *   预警 slot9：alerts 向量长度。
+ * 不调用 WeatherKit2.decode / encode，不写 $response.body。
  * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
  * @param {number} rawBodyLength - 原始包体字节数，用于越界保护
  * @returns {string[]} 日志行
  */
 function dumpWK3Root(ByteBuffer, rawBodyLength) {
+    const fieldOffsetOf = (tablePos, index) => {
+        try {
+            return ByteBuffer.__offset(tablePos, 4 + index * 2);
+        } catch {
+            return 0;
+        }
+    };
+    const readFloat = (tablePos, index) => {
+        const offset = fieldOffsetOf(tablePos, index);
+        if (!offset) return null;
+        try {
+            const value = ByteBuffer.readFloat32(tablePos + offset);
+            return Number.isFinite(value) ? value : null;
+        } catch {
+            return null;
+        }
+    };
+    const readUint = (tablePos, index) => {
+        const offset = fieldOffsetOf(tablePos, index);
+        if (!offset) return null;
+        try {
+            return ByteBuffer.readUint32(tablePos + offset);
+        } catch {
+            return null;
+        }
+    };
+    const readInt8 = (tablePos, index) => {
+        const offset = fieldOffsetOf(tablePos, index);
+        if (!offset) return null;
+        try {
+            return ByteBuffer.readInt8(tablePos + offset);
+        } catch {
+            return null;
+        }
+    };
+    const readInt16 = (tablePos, index) => {
+        const offset = fieldOffsetOf(tablePos, index);
+        if (!offset) return null;
+        try {
+            return ByteBuffer.readInt16(tablePos + offset);
+        } catch {
+            return null;
+        }
+    };
+    const vectorInfo = (tablePos, index) => {
+        const offset = fieldOffsetOf(tablePos, index);
+        if (!offset) return null;
+        try {
+            const vecPos = tablePos + offset + ByteBuffer.readInt32(tablePos + offset);
+            if (vecPos < 0 || vecPos + 4 > rawBodyLength) return null;
+            const len = ByteBuffer.readInt32(vecPos);
+            if (len < 0 || len > 1000 || vecPos + 4 + len * 4 > rawBodyLength) return null;
+            let elemFields = null;
+            if (len > 0) {
+                const elemPos = vecPos + 4;
+                const elemTarget = elemPos + ByteBuffer.readInt32(elemPos);
+                if (elemTarget >= 0 && elemTarget < rawBodyLength) {
+                    const elemVtableLength = ByteBuffer.readUint16(elemTarget - ByteBuffer.readInt32(elemTarget));
+                    const count = Math.floor((elemVtableLength - 4) / 2);
+                    if (elemVtableLength >= 4 && count > 0 && count <= 64) elemFields = count;
+                }
+            }
+            return { len, elemFields };
+        } catch {
+            return null;
+        }
+    };
+    const fmtFloat = value => (value === null ? "?" : value.toFixed(2));
     try {
         const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
         const vtablePos = rootPos - ByteBuffer.readInt32(rootPos);
         const vtableLength = ByteBuffer.readUint16(vtablePos);
         const fieldCount = Math.floor((vtableLength - 4) / 2);
+        if (vtableLength === 4) {
+            // 空根表（如中国大陆单项下一小时）：不是失败，是数据为空。
+            return [`WK3 root: empty (fields=0) bodyLength=${rawBodyLength}`];
+        }
         if (vtableLength < 4 || fieldCount <= 0 || fieldCount > 64) {
             return [`WK3 slot dump failed: unexpected root vtable length ${vtableLength}`];
         }
         const lines = [`WK3 root: fields=${fieldCount} bodyLength=${rawBodyLength}`];
+        let cwTablePos = null;
+        let nextHourTablePos = null;
+        let alertsTablePos = null;
         for (let slot = 0; slot < fieldCount; slot++) {
             const fieldOffset = ByteBuffer.__offset(rootPos, 4 + slot * 2);
             if (!fieldOffset) {
@@ -215,6 +295,9 @@ function dumpWK3Root(ByteBuffer, rawBodyLength) {
                 lines.push(`WK3 slot ${slot}: unexpected subtable vtable length ${subVtableLength}`);
                 continue;
             }
+            if (slot === 1) cwTablePos = tablePos;
+            if (slot === 5) nextHourTablePos = tablePos;
+            if (slot === 9) alertsTablePos = tablePos;
             const strings = [];
             for (let sub = 0; sub < subFieldCount && strings.length < 3; sub++) {
                 const subOffset = ByteBuffer.__offset(tablePos, 4 + sub * 2);
@@ -228,7 +311,32 @@ function dumpWK3Root(ByteBuffer, rawBodyLength) {
                     // 非字符串字段按 __string 读会失败或出乱码，直接跳过，不影响透传。
                 }
             }
-            lines.push(`WK3 slot ${slot}: fields=${subFieldCount}${strings.length ? ` strings=[${strings.join(" | ")}]` : ""}`);
+            let extra = "";
+            if (slot === 0) {
+                const category = readInt8(tablePos, 1);
+                const index = readInt16(tablePos, 2);
+                if (category !== null && index !== null) extra += ` aqCategory=${category} aqIndex=${index}`;
+            }
+            if (subFieldCount === 2) {
+                const vec = vectorInfo(tablePos, 1);
+                if (vec) extra += ` vec1Len=${vec.len}${vec.elemFields !== null ? ` elem0Fields=${vec.elemFields}` : ""}`;
+            }
+            lines.push(`WK3 slot ${slot}: fields=${subFieldCount}${strings.length ? ` strings=[${strings.join(" | ")}]` : ""}${extra}`);
+        }
+        if (cwTablePos !== null) {
+            lines.push(
+                `WK3 cw: asOf=${readUint(cwTablePos, 2) ?? "?"} humidity=${readInt8(cwTablePos, 8) ?? "?"} pressure=${fmtFloat(readFloat(cwTablePos, 23))} f25=${fmtFloat(readFloat(cwTablePos, 25))} f26=${fmtFloat(readFloat(cwTablePos, 26))} f27=${fmtFloat(readFloat(cwTablePos, 27))} f31=${fmtFloat(readFloat(cwTablePos, 31))} f32=${fmtFloat(readFloat(cwTablePos, 32))}`,
+            );
+        }
+        if (nextHourTablePos !== null) {
+            const minutes = vectorInfo(nextHourTablePos, 5);
+            lines.push(
+                `WK3 nextHour: start=${readUint(nextHourTablePos, 3) ?? "?"} end=${readUint(nextHourTablePos, 4) ?? "?"} minutesLen=${minutes ? minutes.len : "?"} minutesElem0Fields=${minutes && minutes.elemFields !== null ? minutes.elemFields : "?"}`,
+            );
+        }
+        if (alertsTablePos !== null) {
+            const alerts = vectorInfo(alertsTablePos, 2);
+            if (alerts) lines.push(`WK3 alerts: vecLen=${alerts.len}${alerts.elemFields !== null ? ` elem0Fields=${alerts.elemFields}` : ""}`);
         }
         return lines;
     } catch (error) {

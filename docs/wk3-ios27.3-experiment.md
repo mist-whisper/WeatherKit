@@ -113,3 +113,22 @@ Authorization 令牌。本页只保留了脱敏后的 URL、响应头名和包�
   slot9 应为 fields=3 且 strings 里有 alertDetails 链接，
   slot7 应为 fields=4（WeatherChanges，时间戳字段不直接显示为字符串）。
 - 本探针不证明 WK3 解码正确，只提供槽位清单，供离线对照 WK2 映射使用。
+
+## 探针 v3（2026-11-04，只记日志、不改数据）
+
+- 仍是透传：不调用 WeatherKit2.decode / encode，不写 `$response.body`；
+  每个读数都带越界与合理性校验，失败只跳过该项。
+- 在 v2 槽位清单基础上新增：
+  - 空根表不再记成 failed：vtable 长度 4 时记 `WK3 root: empty (fields=0)`，
+    即中国大陆单项下一小时那种 12 字节空包体。
+  - 2 字段包装表：字段1 的向量长度与首元素表字段数（`vec1Len=` /
+    `elem0Fields=`），用于区分每日（11 条 / 元素 34 字段）、小时
+    （274 条 / 元素 25 字段）、历史对比（2 条 / 元素 5 字段）等。
+  - 空气质量 slot0：`aqCategory=` / `aqIndex=`。
+  - 当前天气 slot1：单独一行 `WK3 cw:`，含 asOf（字段2 时间戳）、
+    humidity（字段8）、pressure（字段23）与候选温度字段 f25 / f26 / f27 /
+    f31 / f32 的浮点值；温度字段尚未最终证实，日志里只记数值、不下结论，
+    需与界面温度对照。
+  - 下一小时 slot5：`WK3 nextHour:`，含 forecastStart / forecastEnd 与
+    minutes 向量长度及首元素字段数。
+  - 预警 slot9：`WK3 alerts:`，含 alerts 向量长度及首元素字段数。

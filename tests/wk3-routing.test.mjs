@@ -34,6 +34,15 @@ test("Probe v2 只记槽位清单、不改包体，schema 版本取请求头", (
     assert.doesNotMatch(v3Block, /\$response\.body\s*=/);
 });
 
+test("Probe v3 只记数值、不改包体：当前天气候选浮点、包装表向量、下一小时与预警", () => {
+    assert.match(response, /probe v3: log only, body unchanged/);
+    assert.match(response, /WK3 cw: asOf=/);
+    assert.match(response, /WK3 nextHour: start=/);
+    assert.match(response, /WK3 alerts: vecLen=/);
+    assert.match(response, /vec1Len=/);
+    assert.match(response, /WK3 root: empty \(fields=0\)/);
+});
+
 test("Request 对 v3 沿用 v2 的 country 补齐分支", () => {
     assert.match(request, /startsWith\("\/api\/v3\/weather\/"\)/);
 });
