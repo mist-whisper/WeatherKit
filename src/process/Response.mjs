@@ -87,6 +87,21 @@ export async function Response($request, $response) {
                     switch (url.hostname) {
                         case "weatherkit.apple.com":
                             // 路径判断
+                            // WK3 实验探针（iOS 27.3 beta 1）：只记录 v3 触发，不解码、不重编码、不替换数据。
+                            // WK3 的 FlatBuffer schema 尚未映射，WK2 编解码器不能直接用于 WK3.Weather，
+                            // 这里原样透传是为了在真机上先确认脚本能被 v3 触发、日志能看到 messageType / schema 版本，
+                            // 而不是假装修复。完整修复需要先拿到 WK3 的 root slot 映射，见 docs/wk3-ios27.3-experiment.md。
+                            if (url.pathname.startsWith("/api/v3/weather/")) {
+                                const parameters = parseWeatherKitURL(url);
+                                Console.warn(
+                                    "WK3 weather response passthrough (experiment, not a fix)",
+                                    `messageType: ${$response.headers?.["Content-Type"] ?? $response.headers?.["content-type"]}`,
+                                    `schema-version: ${$response.headers?.["x-schema-version"] ?? $response.headers?.["X-Schema-Version"]}`,
+                                    `dataSets: ${parameters.dataSets.join(",")}`,
+                                    `country: ${parameters.country}`,
+                                );
+                                break;
+                            }
                             if (url.pathname.startsWith("/api/v2/weather/")) {
                                 const parameters = parseWeatherKitURL(url);
                                 const dataSets = parameters.dataSets.filter(dataSet => Settings.DataSets.includes(dataSet));
