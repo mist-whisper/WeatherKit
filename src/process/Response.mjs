@@ -87,15 +87,18 @@ export async function Response($request, $response) {
                     switch (url.hostname) {
                         case "weatherkit.apple.com":
                             // 路径判断
-                            // WK3 实验探针（iOS 27.3 beta 1）：只记录 v3 触发，不解码、不重编码、不替换数据。
-                            // WK3 的 FlatBuffer schema 尚未映射，WK2 编解码器不能直接用于 WK3.Weather，
-                            // 这里原样透传是为了在真机上先确认脚本能被 v3 触发、日志能看到 messageType / schema 版本，
-                            // 而不是假装修复。完整修复需要先拿到 WK3 的 root slot 映射，见 docs/wk3-ios27.3-experiment.md。
+                            // WK3 实验（iOS 27.3 beta 1）：探针 v3 + 空气质量 scale 原位替换原型。
+                            // WK3 的 FlatBuffer schema 尚未完整映射，WK2 编解码器不能直接用于 WK3.Weather，
+                            // 所以不做全量解码/重编码：只把 slot0 空气质量表的 scale 字符串原位换成
+                            // 等长测试串（14 字节），其余所有字节原封不动；任一条件不符就原样返回。
+                            // 完整修复需要先拿到 WK3 的 root slot 映射，见 docs/wk3-ios27.3-experiment.md。
                             if (url.pathname.startsWith("/api/v3/weather/")) {
                                 const parameters = parseWeatherKitURL(url);
                                 const slotLines = dumpWK3Root(ByteBuffer, rawBody.length);
+                                const aqReplace = replaceWK3AQScale(ByteBuffer, rawBody, parameters.country);
+                                if (aqReplace.body) rawBody = aqReplace.body;
                                 Console.warn(
-                                    "WK3 weather response passthrough (experiment, not a fix) [probe v3: log only, body unchanged]",
+                                    "WK3 weather response (experiment, not a fix) [aqReplace prototype: AQ scale only, all other bytes unchanged, fail -> original]",
                                     `messageType: ${$response.headers?.["Content-Type"] ?? $response.headers?.["content-type"]}`,
                                     // v1 探针读响应头得到 undefined 是取错了地方：schema 版本在请求头里，
                                     // 响应头里没有这个字段，所以 v2 两边都记，互相对照。
@@ -104,6 +107,7 @@ export async function Response($request, $response) {
                                     `dataSets: ${parameters.dataSets.join(",")}`,
                                     `country: ${parameters.country}`,
                                     ...slotLines,
+                                    aqReplace.log,
                                 );
                                 break;
                             }
@@ -175,6 +179,62 @@ export async function Response($request, $response) {
         }
     }
     return $response;
+}
+
+/**
+ * WK3 空气质量 scale 原位替换原型：只换 slot0 的 scale 字符串，不碰其他任何字节。
+ * 适用条件全部满足才换，否则原样返回（body 为 null）：
+ * - country 为 CN（只在大陆主请求上试验）；
+ * - 根表非空，slot0 子表存在；
+ * - 子表里能找到且仅找到原生 scale 字符串 "HJ6332012.2604"（14 字节）；
+ * - 测试串 "TEST.WK3.00001" 同为 14 字节，原位覆盖不改变包体长度与任何偏移。
+ * 不调用 WeatherKit2.decode / encode，不重建 FlatBuffer，不改任何其他槽位。
+ * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
+ * @param {Uint8Array} rawBody - 原始包体（不原地修改，成功时返回新拷贝）
+ * @param {string} country - 请求的 country 参数
+ * @returns {{body: Uint8Array | null, log: string}}
+ */
+function replaceWK3AQScale(ByteBuffer, rawBody, country) {
+    const EXPECTED = "HJ6332012.2604";
+    const TEST = "TEST.WK3.00001";
+    try {
+        if (country !== "CN") return { body: null, log: "WK3 aqReplace: skipped (country != CN)" };
+        if (EXPECTED.length !== TEST.length) return { body: null, log: "WK3 aqReplace: skipped (test string length mismatch)" };
+        const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
+        const vtablePos = rootPos - ByteBuffer.readInt32(rootPos);
+        const fieldCount = Math.floor((ByteBuffer.readUint16(vtablePos) - 4) / 2);
+        if (fieldCount <= 0) return { body: null, log: "WK3 aqReplace: skipped (empty root)" };
+        const slot0Offset = ByteBuffer.__offset(rootPos, 4);
+        if (!slot0Offset) return { body: null, log: "WK3 aqReplace: skipped (slot 0 absent)" };
+        const tablePos = ByteBuffer.__indirect(rootPos + slot0Offset);
+        const subVtablePos = tablePos - ByteBuffer.readInt32(tablePos);
+        const subFieldCount = Math.floor((ByteBuffer.readUint16(subVtablePos) - 4) / 2);
+        if (subFieldCount <= 0 || subFieldCount > 64) return { body: null, log: "WK3 aqReplace: skipped (unexpected AQ subtable)" };
+        let dataPos = -1;
+        for (let sub = 0; sub < subFieldCount; sub++) {
+            const subOffset = ByteBuffer.__offset(tablePos, 4 + sub * 2);
+            if (!subOffset) continue;
+            let value;
+            try {
+                value = ByteBuffer.__string(tablePos + subOffset);
+            } catch {
+                continue;
+            }
+            if (value === EXPECTED) {
+                const stringPos = tablePos + subOffset;
+                const stringLen = ByteBuffer.readInt32(stringPos + ByteBuffer.readInt32(stringPos));
+                if (stringLen !== EXPECTED.length) return { body: null, log: "WK3 aqReplace: skipped (scale length mismatch)" };
+                dataPos = stringPos + ByteBuffer.readInt32(stringPos) + 4;
+                break;
+            }
+        }
+        if (dataPos < 0 || dataPos + EXPECTED.length > rawBody.length) return { body: null, log: "WK3 aqReplace: skipped (scale string not found)" };
+        const modified = new Uint8Array(rawBody);
+        for (let i = 0; i < TEST.length; i++) modified[dataPos + i] = TEST.charCodeAt(i);
+        return { body: modified, log: `WK3 aqReplace: ${EXPECTED} -> ${TEST}` };
+    } catch (error) {
+        return { body: null, log: `WK3 aqReplace: skipped (${error?.message ?? error})` };
+    }
 }
 
 /**

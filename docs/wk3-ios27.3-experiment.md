@@ -132,3 +132,15 @@ Authorization 令牌。本页只保留了脱敏后的 URL、响应头名和包�
   - 下一小时 slot5：`WK3 nextHour:`，含 forecastStart / forecastEnd 与
     minutes 向量长度及首元素字段数。
   - 预警 slot9：`WK3 alerts:`，含 alerts 向量长度及首元素字段数。
+
+## 空气质量 scale 原位替换原型（2026-11-04，不做全量解码）
+
+- 只换 slot0 空气质量表的 scale 字符串：原生 `HJ6332012.2604`
+  （14 字节）原位覆盖为测试串 `TEST.WK3.00001`（同为 14 字节），
+  包体长度与所有偏移不变，其余字节一概不动；任一条件不符就原样返回。
+- 适用条件：country 为 CN；根表非空；slot0 存在；子表里找到原生 scale 串。
+  非 CN、东京的 EPA scale、空根表一律跳过并记一行 skipped 原因。
+- 不调用 WeatherKit2.decode / encode，不重建 FlatBuffer。
+- 离线验证（北京包体）：替换后长度不变，14 字节范围内 13 字节变化、
+  1 字节恰好相同（均为 `0`），其余全部字节相同；探针 v3 再跑替换后包体，
+  只有 slot0 的 scale 字符串一行变化，aqCategory / aqIndex 与其余槽位全不变。

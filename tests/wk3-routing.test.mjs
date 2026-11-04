@@ -17,9 +17,9 @@ test("Loon 模板保留 v2 规则，并行新增 v3 规则", () => {
     assert.match(loon, /WeatherKit\.api\.v3\.weather\.response/);
 });
 
-test("Response 对 v3 只做透传探针，不走 WK2 解码", () => {
+test("Response 对 v3 做探针 + AQ 原位替换，不走 WK2 解码", () => {
     assert.match(response, /startsWith\("\/api\/v3\/weather\/"\)/);
-    assert.match(response, /WK3 weather response passthrough \(experiment, not a fix\)/);
+    assert.match(response, /aqReplace prototype: AQ scale only/);
 });
 
 test("Probe v2 只记槽位清单、不改包体，schema 版本取请求头", () => {
@@ -35,12 +35,24 @@ test("Probe v2 只记槽位清单、不改包体，schema 版本取请求头", (
 });
 
 test("Probe v3 只记数值、不改包体：当前天气候选浮点、包装表向量、下一小时与预警", () => {
-    assert.match(response, /probe v3: log only, body unchanged/);
     assert.match(response, /WK3 cw: asOf=/);
     assert.match(response, /WK3 nextHour: start=/);
     assert.match(response, /WK3 alerts: vecLen=/);
     assert.match(response, /vec1Len=/);
     assert.match(response, /WK3 root: empty \(fields=0\)/);
+});
+
+test("AQ 原位替换原型：只换 CN 的等长 scale 串，不解码、不重建、失败原样返回", () => {
+    assert.match(response, /function replaceWK3AQScale/);
+    assert.match(response, /HJ6332012\.2604/);
+    assert.match(response, /TEST\.WK3\.00001/);
+    assert.match(response, /country !== "CN"/);
+    assert.match(response, /new Uint8Array\(rawBody\)/);
+    // v3 分支内不得出现 WK2 解码/编码。
+    const v3Start = response.indexOf('startsWith("/api/v3/weather/")');
+    const v2Start = response.indexOf('startsWith("/api/v2/weather/")', v3Start);
+    const v3Block = response.slice(v3Start, v2Start);
+    assert.doesNotMatch(v3Block, /WeatherKit2\.decode|WeatherKit2\.encode/);
 });
 
 test("Request 对 v3 沿用 v2 的 country 补齐分支", () => {
