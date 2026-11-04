@@ -87,19 +87,20 @@ export async function Response($request, $response) {
                     switch (url.hostname) {
                         case "weatherkit.apple.com":
                             // 路径判断
-                            // WK3 实验（iOS 27.3 beta 1）：探针 v3 + 空气质量数值原位替换原型。
+                            // WK3 实验（iOS 27.3 beta 1）：探针 v3 + 当前天气温度原位替换原型。
                             // WK3 的 FlatBuffer schema 尚未完整映射，WK2 编解码器不能直接用于 WK3.Weather，
-                            // 所以不做全量解码/重编码。beta4 已证实换 scale 串会让 App 整段丢弃空气质量，
-                            // 因此本版 scale 串原样不动，只原位改 slot0 的 category / index 两个数值字段，
-                            // 其余所有字节原封不动；任一条件不符就原样返回。
+                            // 所以不做全量解码/重编码。本版只原位改 slot1 的温度字段（字段25）与
+                            // 体感字段（字段26）为固定测试值 25.00，并按新温度与原湿度用 Magnus 公式
+                            // 重算露点字段（字段27），其余所有字节原封不动；任一条件不符就原样返回。
+                            // 空气质量本版不动（beta5 的 AQ 数值替换已验证，不再重复试验）。
                             // 完整修复需要先拿到 WK3 的 root slot 映射，见 docs/wk3-ios27.3-experiment.md。
                             if (url.pathname.startsWith("/api/v3/weather/")) {
                                 const parameters = parseWeatherKitURL(url);
                                 const slotLines = dumpWK3Root(ByteBuffer, rawBody.length);
-                                const aqReplace = replaceWK3AQValues(ByteBuffer, rawBody, parameters.country);
-                                if (aqReplace.body) rawBody = aqReplace.body;
+                                const cwReplace = replaceWK3CWTemperature(ByteBuffer, rawBody, parameters.country);
+                                if (cwReplace.body) rawBody = cwReplace.body;
                                 Console.warn(
-                                    "WK3 weather response (experiment, not a fix) [aqReplace prototype: AQ values only, scale unchanged, all other bytes unchanged, fail -> original]",
+                                    "WK3 weather response (experiment, not a fix) [cwReplace prototype: CW temperature only, all other bytes unchanged, fail -> original]",
                                     `messageType: ${$response.headers?.["Content-Type"] ?? $response.headers?.["content-type"]}`,
                                     // v1 探针读响应头得到 undefined 是取错了地方：schema 版本在请求头里，
                                     // 响应头里没有这个字段，所以 v2 两边都记，互相对照。
@@ -108,7 +109,7 @@ export async function Response($request, $response) {
                                     `dataSets: ${parameters.dataSets.join(",")}`,
                                     `country: ${parameters.country}`,
                                     ...slotLines,
-                                    aqReplace.log,
+                                    cwReplace.log,
                                 );
                                 break;
                             }
@@ -183,61 +184,58 @@ export async function Response($request, $response) {
 }
 
 /**
- * WK3 空气质量数值原位替换原型：只改 slot0 的 category / index，不碰 scale 串与其他字节。
- * beta4 教训：换 scale 串会让 App 整段丢弃空气质量，因此本版 scale 串原样不动。
+ * WK3 当前天气温度原位替换原型：只改 slot1 的温度 / 体感 / 露点三个浮点字段。
+ * 字段身份已由四例露点公式证实：字段25 = 温度、字段27 = 露点、字段8 = 湿度、
+ * 字段26 与温度接近、位于体感位置（暂列体感候选，本版与温度同值写入）。
  * 适用条件全部满足才换，否则原样返回（body 为 null）：
- * - country 为 CN（只在大陆主请求上试验）；
- * - 根表非空，slot0 子表存在且至少 3 个字段；
- * - 子表里能找到原生 scale 字符串 "HJ6332012.2604"（确认是大陆空气质量表）；
- * - category（字段1，int8）与 index（字段2，int16）均可读。
- * 测试值：category 改为 4，index 改为 200（与原值 1/27、2/55、3/141 均明显不同，
- * 且 category 与 index 按 50 一档对应一致，避免 App 因两者矛盾而丢弃）。
- * 原位覆盖不改变包体长度与任何偏移。不调用 WeatherKit2.decode / encode，
+ * - country 为 CN（只在大陆主请求上试验，非 CN 城市作对照，温度保持真实）；
+ * - 根表非空，slot1 子表存在且至少 28 个字段；
+ * - 湿度（字段8，int8）、温度（字段25，float32）、体感（字段26，float32）、
+ *   露点（字段27，float32）均可读且湿度在 0-100 之间。
+ * 测试值：温度与体感均改为 25.00，露点按 Magnus 公式以新温度与原湿度重算，
+ * 其余所有字节原封不动，包体长度与偏移不变。不调用 WeatherKit2.decode / encode，
  * 不重建 FlatBuffer，不改任何其他槽位。
  * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
  * @param {Uint8Array} rawBody - 原始包体（不原地修改，成功时返回新拷贝）
  * @param {string} country - 请求的 country 参数
  * @returns {{body: Uint8Array | null, log: string}}
  */
-function replaceWK3AQValues(ByteBuffer, rawBody, country) {
-    const EXPECTED_SCALE = "HJ6332012.2604";
-    const TEST_CATEGORY = 4;
-    const TEST_INDEX = 200;
+function replaceWK3CWTemperature(ByteBuffer, rawBody, country) {
+    const TEST_TEMPERATURE = 25.0;
     try {
-        if (country !== "CN") return { body: null, log: "WK3 aqReplace: skipped (country != CN)" };
+        if (country !== "CN") return { body: null, log: "WK3 cwReplace: skipped (country != CN)" };
         const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
         const vtablePos = rootPos - ByteBuffer.readInt32(rootPos);
         const fieldCount = Math.floor((ByteBuffer.readUint16(vtablePos) - 4) / 2);
-        if (fieldCount <= 0) return { body: null, log: "WK3 aqReplace: skipped (empty root)" };
-        const slot0Offset = ByteBuffer.__offset(rootPos, 4);
-        if (!slot0Offset) return { body: null, log: "WK3 aqReplace: skipped (slot 0 absent)" };
-        const tablePos = ByteBuffer.__indirect(rootPos + slot0Offset);
+        if (fieldCount <= 1) return { body: null, log: "WK3 cwReplace: skipped (slot 1 absent or empty root)" };
+        const slot1Offset = ByteBuffer.__offset(rootPos, 6);
+        if (!slot1Offset) return { body: null, log: "WK3 cwReplace: skipped (slot 1 absent)" };
+        const tablePos = ByteBuffer.__indirect(rootPos + slot1Offset);
         const subVtablePos = tablePos - ByteBuffer.readInt32(tablePos);
         const subFieldCount = Math.floor((ByteBuffer.readUint16(subVtablePos) - 4) / 2);
-        if (subFieldCount < 3 || subFieldCount > 64) return { body: null, log: "WK3 aqReplace: skipped (unexpected AQ subtable)" };
-        let scaleFound = false;
-        for (let sub = 0; sub < subFieldCount; sub++) {
-            const subOffset = ByteBuffer.__offset(tablePos, 4 + sub * 2);
-            if (!subOffset) continue;
-            try {
-                if (ByteBuffer.__string(tablePos + subOffset) === EXPECTED_SCALE) scaleFound = true;
-            } catch {
-                continue;
-            }
+        if (subFieldCount < 28 || subFieldCount > 64) return { body: null, log: "WK3 cwReplace: skipped (unexpected CW subtable)" };
+        const humidityOffset = ByteBuffer.__offset(tablePos, 20);
+        const tempOffset = ByteBuffer.__offset(tablePos, 54);
+        const apparentOffset = ByteBuffer.__offset(tablePos, 56);
+        const dewOffset = ByteBuffer.__offset(tablePos, 58);
+        if (!humidityOffset || !tempOffset || !apparentOffset || !dewOffset) return { body: null, log: "WK3 cwReplace: skipped (CW temp/apparent/dew field absent)" };
+        const humidity = ByteBuffer.readInt8(tablePos + humidityOffset);
+        const oldTemp = ByteBuffer.readFloat32(tablePos + tempOffset);
+        const oldApparent = ByteBuffer.readFloat32(tablePos + apparentOffset);
+        const oldDew = ByteBuffer.readFloat32(tablePos + dewOffset);
+        if (!Number.isFinite(oldTemp) || !Number.isFinite(oldApparent) || !Number.isFinite(oldDew) || humidity < 0 || humidity > 100) {
+            return { body: null, log: "WK3 cwReplace: skipped (CW values out of range)" };
         }
-        if (!scaleFound) return { body: null, log: "WK3 aqReplace: skipped (CN scale string not found)" };
-        const categoryOffset = ByteBuffer.__offset(tablePos, 6);
-        const indexOffset = ByteBuffer.__offset(tablePos, 8);
-        if (!categoryOffset || !indexOffset) return { body: null, log: "WK3 aqReplace: skipped (AQ category/index field absent)" };
-        const oldCategory = ByteBuffer.readInt8(tablePos + categoryOffset);
-        const oldIndex = ByteBuffer.readInt16(tablePos + indexOffset);
+        const alpha = (17.27 * TEST_TEMPERATURE) / (237.7 + TEST_TEMPERATURE) + Math.log(humidity / 100);
+        const newDew = (237.7 * alpha) / (17.27 - alpha);
         const modified = new Uint8Array(rawBody);
-        modified[tablePos + categoryOffset] = TEST_CATEGORY;
-        modified[tablePos + indexOffset] = TEST_INDEX & 0xff;
-        modified[tablePos + indexOffset + 1] = (TEST_INDEX >> 8) & 0xff;
-        return { body: modified, log: `WK3 aqReplace: scale unchanged, category ${oldCategory}->${TEST_CATEGORY} index ${oldIndex}->${TEST_INDEX}` };
+        const view = new DataView(modified.buffer, modified.byteOffset, modified.byteLength);
+        view.setFloat32(tablePos + tempOffset, TEST_TEMPERATURE, true);
+        view.setFloat32(tablePos + apparentOffset, TEST_TEMPERATURE, true);
+        view.setFloat32(tablePos + dewOffset, newDew, true);
+        return { body: modified, log: `WK3 cwReplace: temp ${oldTemp.toFixed(2)}->${TEST_TEMPERATURE.toFixed(2)} apparent ${oldApparent.toFixed(2)}->${TEST_TEMPERATURE.toFixed(2)} dew ${oldDew.toFixed(2)}->${newDew.toFixed(2)} humidity ${humidity}` };
     } catch (error) {
-        return { body: null, log: `WK3 aqReplace: skipped (${error?.message ?? error})` };
+        return { body: null, log: `WK3 cwReplace: skipped (${error?.message ?? error})` };
     }
 }
 
