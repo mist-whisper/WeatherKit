@@ -244,7 +244,9 @@ export async function Response($request, $response) {
  * 按原始字节保留，不需要先认清未知槽位的内部 schema（PR #69 的
  * copy-on-write 思路，离线已在北京、东京两体上验证通过）。
  * 新包体布局：[新根表 uoffset][新根表 vtable][新根表][新 AQ vtable]
- * [新 AQ 表][原始包体 verbatim（8 字节对齐的 opaque blob）]。
+ * [新 AQ 表][新 scale 串（若变）][新污染物 vtable + 各污染物表 + 新向量
+ * （若传 options.pollutants 且校验通过，否则向量仍指向 blob）]
+ * [原始包体 verbatim（8 字节对齐的 opaque blob）]。
  * 新根表除 slot0 外的每个字段都重算指向 blob 内的原表；新 AQ 表的
  * 3 个偏移字段（元数据、污染物向量、scale 串）也重算指向 blob，
  * 首要污染物字段经表字节核实为 1 字节枚举、不是偏移，绝不重算。
@@ -263,8 +265,9 @@ export async function Response($request, $response) {
  */
 /**
  * WK3 AQ 全套（跟随设置）：用原污染物按设置的算法算指数，一起换 category /
- * index / 主污染物 / scale 串，昨日对比保持原值，污染物空了不补
- * （先只做污染物本来就有的城市），元数据与污染物向量保持原样。
+ * index / 主污染物 / scale 串，并重建污染物向量（换算过的量与单位写回，
+ * 没换算的保留原量与原单位字节），昨日对比保持原值，污染物空了不补
+ * （先只做污染物本来就有的城市），元数据保持原样。
  * 门全部跟随设置，不再写死：国家门跟 Settings.Weather.Replace
  * （默认 ["CN"]），scale 门跟 Settings.AirQuality.Current.Index.Replace
  * （默认 ["HJ6332012"]），算法跟 Settings.AirQuality.Calculate.Algorithm
@@ -278,8 +281,10 @@ export async function Response($request, $response) {
  * 原污染物浓度本身已是 µg 量级（CO 220、PM2.5 38 等），且欧标
  * 全是 µg 目标时按原量算结果正确；此处把它当作微克喂给计算，
  * 这样美标气体才能从微克正确换算成 ppb；若该推断错，美标气体
- * 指数会系统性偏离，需装机对照验证。污染物向量本身仍保持原样
- * （显示层面的单位与换算后浓度未重建，属后续步骤）。
+ * 指数会系统性偏离，需装机对照验证。污染物向量重建规则：换算
+ * 后量或单位变了的，写换算值；量与单位串都没变的（无分段表的
+ * 污染物、换算失败、µg→µg 恒等换算），一律保留原量与原单位字节，
+ * 避免把原字节 2 误写成 µg 枚举。
  * 任一校验失败都原样返回。
  * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
  * @param {Uint8Array} rawBody - 原始包体
@@ -328,6 +333,7 @@ function calculateWK3AQ(ByteBuffer, rawBody, country, Settings) {
         // 大量出现单位字节 2，且浓度是 µg 量级，故计算时把它当作微克（推断，见函数注释）。
         const unitTypes = ["PARTS_PER_BILLION", "MICROGRAMS_PER_CUBIC_METER", "MICROGRAMS_PER_CUBIC_METER", "UNKNOWN3"];
         const pollutants = [];
+        const origPollutants = [];
         for (let i = 0; i < vecLen; i++) {
             const elemPos = ByteBuffer.__indirect(vecPos + 4 + i * 4);
             const typeOffset = ByteBuffer.__offset(elemPos, 4);
@@ -339,6 +345,7 @@ function calculateWK3AQ(ByteBuffer, rawBody, country, Settings) {
             const unitsByte = ByteBuffer.readInt8(elemPos + unitsOffset);
             if (!Number.isFinite(amount) || amount < 0) return { body: null, log: `WK3 aq: skipped (pollutant ${i} amount invalid)` };
             pollutants.push({ pollutantType: pollutantTypes[typeByte] ?? "UNKNOWN", amount, units: unitTypes[unitsByte] ?? "UNKNOWN" });
+            origPollutants.push({ typeByte, amount, unitsByte, units: unitTypes[unitsByte] ?? "UNKNOWN" });
         }
         const effectiveSettings = {
             ...Settings,
@@ -351,15 +358,36 @@ function calculateWK3AQ(ByteBuffer, rawBody, country, Settings) {
         const primaryEnum = pollutantTypes.indexOf(calculated.primaryPollutant);
         if (primaryEnum < 0) return { body: null, log: `WK3 aq: skipped (primary pollutant unknown: ${calculated.primaryPollutant})` };
         const perPollutant = (calculated.pollutants ?? []).map(p => `${p.pollutantType}=${Number.isFinite(p.index) ? p.index.toFixed(2) : p.index}`).join(" ");
+        // 污染物向量重建输入：按原顺序、按类型对齐计算结果；量或单位串
+        // 没变的写回原字节（见函数注释），变了的写换算值与目标单位枚举。
+        const unitEnumByName = { PARTS_PER_BILLION: 0, MICROGRAMS_PER_CUBIC_METER: 1, UNKNOWN3: 3 };
+        const calcByType = new Map((calculated.pollutants ?? []).map(p => [p.pollutantType, p]));
+        const newPollutants = origPollutants.map(orig => {
+            const typeName = pollutantTypes[orig.typeByte] ?? "UNKNOWN";
+            const calc = calcByType.get(typeName);
+            const unchanged = { typeEnum: orig.typeByte, amount: orig.amount, unitsEnum: orig.unitsByte };
+            if (!calc || !Number.isFinite(calc.amount) || calc.amount < 0) return unchanged;
+            if (calc.amount === orig.amount && calc.units === orig.units) return unchanged;
+            const unitsEnum = unitEnumByName[calc.units];
+            if (!Number.isInteger(unitsEnum)) return unchanged;
+            return { typeEnum: orig.typeByte, amount: calc.amount, unitsEnum };
+        });
+        const changedDesc = newPollutants.map((p, i) => {
+            const orig = origPollutants[i];
+            if (p.amount === orig.amount && p.unitsEnum === orig.unitsByte) return null;
+            const unitLabel = p.unitsEnum === 0 ? "ppb" : p.unitsEnum === 1 ? "µg" : `byte${p.unitsEnum}`;
+            return `${pollutantTypes[orig.typeByte] ?? "?"} ${orig.amount}->${Number(p.amount.toFixed(2))}${unitLabel}`;
+        }).filter(Boolean).join(", ");
         const overlay = overlayWK3AQ(ByteBuffer, rawBody, country, calculated.categoryIndex, Math.round(calculated.index), {
             scale: calculated.scale,
             primaryEnum,
             isSignificant: calculated.isSignificant,
+            pollutants: newPollutants,
         });
         if (!overlay.body) return { body: null, log: `WK3 aq: overlay failed (${overlay.log})` };
         return {
             body: overlay.body,
-            log: `WK3 aq: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${calculated.scale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (comparison unchanged, pollutants vector unchanged)`,
+            log: `WK3 aq: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${calculated.scale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (comparison unchanged, pollutants vector rebuilt: ${changedDesc || "no changes"})`,
         };
     } catch (error) {
         return { body: null, log: `WK3 aq: skipped (${error?.message ?? error})` };
@@ -418,7 +446,63 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
         const newScaleBytes = scaleChanged ? new TextEncoder().encode(newScale) : null;
         const newScalePos = scaleChanged ? align4(newAqPos + aqTableSize) : null;
         const newScaleSize = scaleChanged ? align4(4 + newScaleBytes.length) : 0;
-        const blobOffset = align8((scaleChanged ? newScalePos + newScaleSize : newAqPos + aqTableSize));
+        // 污染物向量重建：新布局在 scale 串之后依次放污染物 vtable、
+        // 各污染物表（沿用原表字节模板，只改三个标量）、新向量。
+        // 任一前置校验失败都退回 blob 原向量（AQ 替换本身不受影响），
+        // 只有自检失败才放弃整个 overlay。
+        let rebuildPollutants = null;
+        let newPolVtablePositions = [];
+        let newPolTablePositions = [];
+        let newPolVecPos = null;
+        try {
+            const origVecPos = ByteBuffer.__indirect(aqPos + aqPollutantsOffset);
+            const origVecLen = ByteBuffer.readInt32(origVecPos);
+            const want = options.pollutants;
+            if (Array.isArray(want) && want.length === origVecLen && origVecLen > 0 && origVecLen <= 20) {
+                // 注意：原体里各污染物表不一定共享同一张 vtable（实测北京体：
+                // 3 个表长 14、类型字段在 13，另 3 个表长 16、类型字段在 15），
+                // 故每个元素各存自己的 vtable 副本与字段偏移，不做共享假设。
+                let ok = true;
+                const elems = [];
+                for (let i = 0; i < origVecLen; i++) {
+                    const elem = ByteBuffer.__indirect(origVecPos + 4 + i * 4);
+                    const vt = elem - ByteBuffer.readInt32(elem);
+                    const vtableLen = ByteBuffer.readUint16(vt);
+                    const tableSize = ByteBuffer.readUint16(vt + 2);
+                    const typeOff = ByteBuffer.__offset(elem, 4);
+                    const amountOff = ByteBuffer.__offset(elem, 6);
+                    const unitsOff = ByteBuffer.__offset(elem, 8);
+                    if (!typeOff || !amountOff || !unitsOff || vtableLen < 10 || tableSize <= 0 || tableSize > 64) { ok = false; break; }
+                    elems.push({ table: rawBody.subarray(elem, elem + tableSize), vtable: rawBody.subarray(vt, vt + vtableLen), vtableLen, tableSize, typeOff, amountOff, unitsOff });
+                }
+                if (ok) {
+                    for (const p of want) {
+                        if (!Number.isInteger(p.typeEnum) || p.typeEnum < 0 || p.typeEnum > 13 || !Number.isFinite(p.amount) || p.amount < 0 || !Number.isInteger(p.unitsEnum) || p.unitsEnum < 0 || p.unitsEnum > 3) { ok = false; break; }
+                    }
+                }
+                if (ok) {
+                    rebuildPollutants = { want, elems };
+                }
+            }
+        } catch {
+            rebuildPollutants = null;
+        }
+        let cursor = scaleChanged ? newScalePos + newScaleSize : newAqPos + aqTableSize;
+        if (rebuildPollutants) {
+            for (let i = 0; i < rebuildPollutants.elems.length; i++) {
+                const vtablePos = align4(cursor);
+                newPolVtablePositions.push(vtablePos);
+                cursor = vtablePos + rebuildPollutants.elems[i].vtableLen;
+            }
+            for (let i = 0; i < rebuildPollutants.elems.length; i++) {
+                const tablePos = align4(cursor);
+                newPolTablePositions.push(tablePos);
+                cursor = tablePos + rebuildPollutants.elems[i].tableSize;
+            }
+            newPolVecPos = align4(cursor);
+            cursor = newPolVecPos + 4 + rebuildPollutants.want.length * 4;
+        }
+        const blobOffset = align8(cursor);
         const out = new Uint8Array(blobOffset + rawBody.length);
         const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
         view.setUint32(0, newRootPos, true);
@@ -438,9 +522,15 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
         const newAq = new Uint8Array(rawBody.subarray(aqPos, aqPos + aqTableSize));
         const newAqView = new DataView(newAq.buffer, newAq.byteOffset, newAq.byteLength);
         newAqView.setInt32(0, newAqPos - newAqVtablePos, true);
-        for (const fieldOffset of [aqMetaOffset, aqPollutantsOffset]) {
-            const origTarget = ByteBuffer.__indirect(aqPos + fieldOffset);
-            newAqView.setUint32(fieldOffset, origTarget + blobOffset - (newAqPos + fieldOffset), true);
+        {
+            const origTarget = ByteBuffer.__indirect(aqPos + aqMetaOffset);
+            newAqView.setUint32(aqMetaOffset, origTarget + blobOffset - (newAqPos + aqMetaOffset), true);
+        }
+        if (rebuildPollutants) {
+            newAqView.setUint32(aqPollutantsOffset, newPolVecPos - (newAqPos + aqPollutantsOffset), true);
+        } else {
+            const origTarget = ByteBuffer.__indirect(aqPos + aqPollutantsOffset);
+            newAqView.setUint32(aqPollutantsOffset, origTarget + blobOffset - (newAqPos + aqPollutantsOffset), true);
         }
         if (scaleChanged) {
             newAqView.setUint32(aqScaleOffset, newScalePos - (newAqPos + aqScaleOffset), true);
@@ -464,6 +554,27 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
             scaleView.setUint32(newScalePos, newScaleBytes.length, true);
             out.set(newScaleBytes, newScalePos + 4);
         }
+        if (rebuildPollutants) {
+            const outView = new DataView(out.buffer, out.byteOffset, out.byteLength);
+            rebuildPollutants.elems.forEach((elem, i) => {
+                out.set(elem.vtable, newPolVtablePositions[i]);
+            });
+            rebuildPollutants.want.forEach((p, i) => {
+                const elem = rebuildPollutants.elems[i];
+                const tablePos = newPolTablePositions[i];
+                out.set(elem.table, tablePos);
+                const tableView = new DataView(out.buffer, out.byteOffset + tablePos, elem.tableSize);
+                tableView.setInt32(0, tablePos - newPolVtablePositions[i], true);
+                tableView.setInt8(elem.typeOff, p.typeEnum);
+                tableView.setFloat32(elem.amountOff, p.amount, true);
+                tableView.setInt8(elem.unitsOff, p.unitsEnum);
+            });
+            outView.setUint32(newPolVecPos, rebuildPollutants.want.length, true);
+            rebuildPollutants.want.forEach((p, i) => {
+                const elemPos = newPolVecPos + 4 + i * 4;
+                outView.setUint32(elemPos, newPolTablePositions[i] - elemPos, true);
+            });
+        }
         out.set(rawBody, blobOffset);
         // 自检：重建 ByteBuffer 核对关键项。
         const checkBuffer = new flatbuffers.ByteBuffer(out);
@@ -484,7 +595,26 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
         if (checkBuffer.__string(checkAqPos + checkBuffer.__offset(checkAqPos, 18)) !== newScale) {
             return { body: null, log: "WK3 aqOverlay: skipped (self-check scale mismatch)" };
         }
-        return { body: out, log: `WK3 aqOverlay: scale ${scale}->${newScale}, category ${oldCategory}->${newCategory} index ${oldIndex}->${newIndex} (overlay, opaque slots preserved) body ${rawBody.length}->${out.length}` };
+        if (rebuildPollutants) {
+            const checkVecPos = checkBuffer.__indirect(checkAqPos + checkBuffer.__offset(checkAqPos, 12));
+            if (checkBuffer.readInt32(checkVecPos) !== rebuildPollutants.want.length) {
+                return { body: null, log: "WK3 aqOverlay: skipped (self-check pollutants vector length mismatch)" };
+            }
+            for (let i = 0; i < rebuildPollutants.want.length; i++) {
+                const elem = checkBuffer.__indirect(checkVecPos + 4 + i * 4);
+                const want = rebuildPollutants.want[i];
+                if (checkBuffer.readInt8(elem + checkBuffer.__offset(elem, 4)) !== want.typeEnum) {
+                    return { body: null, log: "WK3 aqOverlay: skipped (self-check pollutant type mismatch)" };
+                }
+                if (checkBuffer.readFloat32(elem + checkBuffer.__offset(elem, 6)) !== Math.fround(want.amount)) {
+                    return { body: null, log: "WK3 aqOverlay: skipped (self-check pollutant amount mismatch)" };
+                }
+                if (checkBuffer.readInt8(elem + checkBuffer.__offset(elem, 8)) !== want.unitsEnum) {
+                    return { body: null, log: "WK3 aqOverlay: skipped (self-check pollutant units mismatch)" };
+                }
+            }
+        }
+        return { body: out, log: `WK3 aqOverlay: scale ${scale}->${newScale}, category ${oldCategory}->${newCategory} index ${oldIndex}->${newIndex} (overlay, opaque slots preserved${rebuildPollutants ? ", pollutants vector rebuilt" : ", pollutants vector kept"}) body ${rawBody.length}->${out.length}` };
     } catch (error) {
         return { body: null, log: `WK3 aqOverlay: skipped (${error?.message ?? error})` };
     }
