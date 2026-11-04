@@ -83,3 +83,14 @@ Authorization 令牌。本页只保留了脱敏后的 URL、响应头名和包�
 - 预发布 tag 为 `v3.3.3-beta1`，触发上游同款 pre-release.yml：构建后把 `dist/*` 作为
   预发布附件发布，不设为 latest。构建仍需 fork 里补好 PACKAGE_TOKEN / SUBMODULE_TOKEN，
   否则 npm install / checkout 会失败。
+
+## Fork-only 补充 2（2026-11-04，Node 版本钉住）
+
+- `.github/workflows/build.yml` 把 setup-node 从 `latest` 钉到 `24`（npm 11）。
+  原因是 `latest` 现在拉到 npm 12，其 `--allow-remote` 默认是 none，
+  `npm install` 会以 EALLOWREMOTE 拒绝 lockfile 里 `@nsnanocat/util` 的
+  registry.npmjs.org tarball。8 月上游能过的构建用的是 npm 11 时代的 `latest`。
+- 这也是 fork-only 改动，往上游提时要另外定（是钉版本、还是加 `--allow-remote`、
+  还是修 lockfile / .npmrc 一致性），不要原样带进上游 PR。
+- 注意：改完工作流文件后，直接 Re-run 旧 run 仍用旧工作流文件，
+  必须删掉重建 v3.3.3-beta1（或推新 tag）才能测到新工作流。
