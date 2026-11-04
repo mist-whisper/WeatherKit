@@ -144,3 +144,17 @@ Authorization 令牌。本页只保留了脱敏后的 URL、响应头名和包�
 - 离线验证（北京包体）：替换后长度不变，14 字节范围内 13 字节变化、
   1 字节恰好相同（均为 `0`），其余全部字节相同；探针 v3 再跑替换后包体，
   只有 slot0 的 scale 字符串一行变化，aqCategory / aqIndex 与其余槽位全不变。
+
+## 空气质量数值原位替换原型（2026-11-04，beta4 教训后的修正）
+
+- beta4 已证实：换 scale 串会让 App 整段丢弃空气质量，因此本版
+  scale 串原样不动，只原位改 slot0 的 category（字段1，int8）与
+  index（字段2，int16），测试值 category 4 / index 200，
+  与原值按 50 一档对应一致，避免两者矛盾。
+- 适用条件：country 为 CN；根表非空；slot0 存在且至少 3 字段；
+  子表里找到原生 scale 串 HJ6332012.2604；category / index 字段可读。
+  任一条件不符就原样返回，不调用 WeatherKit2.decode / encode，不重建。
+- 离线验证（北京包体）：长度不变，仅 2 字节变化（category 3→4、
+  index 低字节 141→200，高字节 0 不变），scale 串不变；探针 v3 再跑，
+  只有 slot0 的 aqCategory / aqIndex 一行变化，其余槽位全不变。
+  东京（JP）因 country 门跳过，强制 CN 下因 scale 串不匹配跳过，空根表跳过。

@@ -19,7 +19,7 @@ test("Loon 模板保留 v2 规则，并行新增 v3 规则", () => {
 
 test("Response 对 v3 做探针 + AQ 原位替换，不走 WK2 解码", () => {
     assert.match(response, /startsWith\("\/api\/v3\/weather\/"\)/);
-    assert.match(response, /aqReplace prototype: AQ scale only/);
+    assert.match(response, /aqReplace prototype: AQ values only/);
 });
 
 test("Probe v2 只记槽位清单、不改包体，schema 版本取请求头", () => {
@@ -42,10 +42,13 @@ test("Probe v3 只记数值、不改包体：当前天气候选浮点、包装�
     assert.match(response, /WK3 root: empty \(fields=0\)/);
 });
 
-test("AQ 原位替换原型：只换 CN 的等长 scale 串，不解码、不重建、失败原样返回", () => {
-    assert.match(response, /function replaceWK3AQScale/);
+test("AQ 原位替换原型：只换 CN 的 category / index 数值，scale 串不动，不解码、不重建、失败原样返回", () => {
+    assert.match(response, /function replaceWK3AQValues/);
     assert.match(response, /HJ6332012\.2604/);
-    assert.match(response, /TEST\.WK3\.00001/);
+    assert.match(response, /TEST_CATEGORY = 4/);
+    assert.match(response, /TEST_INDEX = 200/);
+    assert.match(response, /scale unchanged/);
+    assert.doesNotMatch(response, /TEST\.WK3\.00001/);
     assert.match(response, /country !== "CN"/);
     assert.match(response, /new Uint8Array\(rawBody\)/);
     // v3 分支内不得出现 WK2 解码/编码。
