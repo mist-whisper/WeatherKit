@@ -17,9 +17,9 @@ test("Loon 模板保留 v2 规则，并行新增 v3 规则", () => {
     assert.match(loon, /WeatherKit\.api\.v3\.weather\.response/);
 });
 
-test("Response 对 v3 做探针 + 当前天气温度原位替换，不走 WK2 解码", () => {
+test("Response 对 v3 做探针 + 当前天气真实温度原位替换，不走 WK2 解码", () => {
     assert.match(response, /startsWith\("\/api\/v3\/weather\/"\)/);
-    assert.match(response, /cwReplace prototype: CW temperature only/);
+    assert.match(response, /cwReplace: CW real provider temperature/);
 });
 
 test("Probe v2 只记槽位清单、不改包体，schema 版本取请求头", () => {
@@ -42,12 +42,14 @@ test("Probe v3 只记数值、不改包体：当前天气候选浮点、包装�
     assert.match(response, /WK3 root: empty \(fields=0\)/);
 });
 
-test("CW 温度原位替换原型：只改 CN 的温度 / 体感 / 露点，露点按新温度重算，不解码、不重建、失败原样返回", () => {
+test("CW 真实温度原位替换：第三方温度 / 体感 / 露点，ColorfulClouds 无露点时用 Magnus 重算，失败原样返回", () => {
     assert.match(response, /function replaceWK3CWTemperature/);
-    assert.match(response, /TEST_TEMPERATURE = 25\.0/);
+    assert.match(response, /providerCurrentWeather\.temperature/);
+    assert.match(response, /temperatureDewPoint/);
     assert.match(response, /country !== "CN"/);
     assert.match(response, /new Uint8Array\(rawBody\)/);
     assert.match(response, /setFloat32/);
+    assert.doesNotMatch(response, /TEST_TEMPERATURE/);
     assert.doesNotMatch(response, /TEST\.WK3\.00001/);
     // v3 分支内不得出现 WK2 解码/编码。
     const v3Start = response.indexOf('startsWith("/api/v3/weather/")');

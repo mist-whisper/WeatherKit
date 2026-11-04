@@ -87,20 +87,39 @@ export async function Response($request, $response) {
                     switch (url.hostname) {
                         case "weatherkit.apple.com":
                             // 路径判断
-                            // WK3 实验（iOS 27.3 beta 1）：探针 v3 + 当前天气温度原位替换原型。
+                            // WK3 实验（iOS 27.3 beta 1）：探针 v3 + 当前天气真实温度原位替换。
                             // WK3 的 FlatBuffer schema 尚未完整映射，WK2 编解码器不能直接用于 WK3.Weather，
-                            // 所以不做全量解码/重编码。本版只原位改 slot1 的温度字段（字段25）与
-                            // 体感字段（字段26）为固定测试值 25.00，并按新温度与原湿度用 Magnus 公式
-                            // 重算露点字段（字段27），其余所有字节原封不动；任一条件不符就原样返回。
-                            // 空气质量本版不动（beta5 的 AQ 数值替换已验证，不再重复试验）。
+                            // 所以不做全量解码/重编码。本版不再写死 25.00：按插件 Settings 的
+                            // Weather.Provider（默认 ColorfulClouds）实时查第三方当前天气，
+                            // 只原位改 slot1 的温度（字段25）、体感（字段26）与露点（字段27），
+                            // 其余所有字节原封不动；第三方查不到、字段不符、country 不在 Replace
+                            // 列表里，一律原样返回。空气质量本版不动。
                             // 完整修复需要先拿到 WK3 的 root slot 映射，见 docs/wk3-ios27.3-experiment.md。
                             if (url.pathname.startsWith("/api/v3/weather/")) {
                                 const parameters = parseWeatherKitURL(url);
                                 const slotLines = dumpWK3Root(ByteBuffer, rawBody.length);
-                                const cwReplace = replaceWK3CWTemperature(ByteBuffer, rawBody, parameters.country);
+                                let providerCurrentWeather = null;
+                                if (Settings?.Weather?.Replace?.includes(parameters.country)) {
+                                    const providerParameters = { ...parameters };
+                                    switch (Settings?.Weather?.Provider) {
+                                        case "QWeather": {
+                                            const qWeather = new QWeather(providerParameters, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host);
+                                            providerCurrentWeather = await qWeather.WeatherNow();
+                                            break;
+                                        }
+                                        case "ColorfulClouds": {
+                                            const colorfulClouds = new ColorfulClouds(providerParameters, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ==");
+                                            providerCurrentWeather = await colorfulClouds.CurrentWeather();
+                                            break;
+                                        }
+                                        default:
+                                            break;
+                                    }
+                                }
+                                const cwReplace = replaceWK3CWTemperature(ByteBuffer, rawBody, parameters.country, Settings?.Weather?.Provider, providerCurrentWeather);
                                 if (cwReplace.body) rawBody = cwReplace.body;
                                 Console.warn(
-                                    "WK3 weather response (experiment, not a fix) [cwReplace prototype: CW temperature only, all other bytes unchanged, fail -> original]",
+                                    "WK3 weather response (experiment, not a fix) [cwReplace: CW real provider temperature, all other bytes unchanged, fail -> original]",
                                     `messageType: ${$response.headers?.["Content-Type"] ?? $response.headers?.["content-type"]}`,
                                     // v1 探针读响应头得到 undefined 是取错了地方：schema 版本在请求头里，
                                     // 响应头里没有这个字段，所以 v2 两边都记，互相对照。
@@ -184,26 +203,36 @@ export async function Response($request, $response) {
 }
 
 /**
- * WK3 当前天气温度原位替换原型：只改 slot1 的温度 / 体感 / 露点三个浮点字段。
+ * WK3 当前天气真实温度原位替换：只改 slot1 的温度 / 体感 / 露点三个浮点字段。
  * 字段身份已由四例露点公式证实：字段25 = 温度、字段27 = 露点、字段8 = 湿度、
- * 字段26 与温度接近、位于体感位置（暂列体感候选，本版与温度同值写入）。
+ * 字段26 与温度接近、位于体感位置。
+ * providerCurrentWeather 是第三方当前天气对象（QWeather.WeatherNow 或
+ * ColorfulClouds.CurrentWeather 的返回值），取其 temperature / temperatureApparent /
+ * temperatureDewPoint；ColorfulClouds 不给露点时，按 Magnus 公式以新温度与原湿度重算。
  * 适用条件全部满足才换，否则原样返回（body 为 null）：
- * - country 为 CN（只在大陆主请求上试验，非 CN 城市作对照，温度保持真实）；
+ * - country 在调用方已确认的 Replace 列表语义下（本函数内仍以 country 为 CN
+ *   作最后一道门，避免非 CN 对照城市被误改）；
  * - 根表非空，slot1 子表存在且至少 28 个字段；
  * - 湿度（字段8，int8）、温度（字段25，float32）、体感（字段26，float32）、
- *   露点（字段27，float32）均可读且湿度在 0-100 之间。
- * 测试值：温度与体感均改为 25.00，露点按 Magnus 公式以新温度与原湿度重算，
- * 其余所有字节原封不动，包体长度与偏移不变。不调用 WeatherKit2.decode / encode，
+ *   露点（字段27，float32）均可读且湿度在 0-100 之间；
+ * - 第三方温度与体感均为有限数。
+ * 原位覆盖不改变包体长度与任何偏移。不调用 WeatherKit2.decode / encode，
  * 不重建 FlatBuffer，不改任何其他槽位。
  * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
  * @param {Uint8Array} rawBody - 原始包体（不原地修改，成功时返回新拷贝）
  * @param {string} country - 请求的 country 参数
+ * @param {string} providerName - 插件 Settings 的 Weather.Provider
+ * @param {any} providerCurrentWeather - 第三方当前天气对象，未查到时为 null
  * @returns {{body: Uint8Array | null, log: string}}
  */
-function replaceWK3CWTemperature(ByteBuffer, rawBody, country) {
-    const TEST_TEMPERATURE = 25.0;
+function replaceWK3CWTemperature(ByteBuffer, rawBody, country, providerName, providerCurrentWeather) {
     try {
         if (country !== "CN") return { body: null, log: "WK3 cwReplace: skipped (country != CN)" };
+        if (!providerCurrentWeather || !Number.isFinite(providerCurrentWeather.temperature) || !Number.isFinite(providerCurrentWeather.temperatureApparent)) {
+            return { body: null, log: `WK3 cwReplace: skipped (provider ${providerName ?? "?"} current weather unavailable, original kept)` };
+        }
+        const newTemp = providerCurrentWeather.temperature;
+        const newApparent = providerCurrentWeather.temperatureApparent;
         const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
         const vtablePos = rootPos - ByteBuffer.readInt32(rootPos);
         const fieldCount = Math.floor((ByteBuffer.readUint16(vtablePos) - 4) / 2);
@@ -226,14 +255,22 @@ function replaceWK3CWTemperature(ByteBuffer, rawBody, country) {
         if (!Number.isFinite(oldTemp) || !Number.isFinite(oldApparent) || !Number.isFinite(oldDew) || humidity < 0 || humidity > 100) {
             return { body: null, log: "WK3 cwReplace: skipped (CW values out of range)" };
         }
-        const alpha = (17.27 * TEST_TEMPERATURE) / (237.7 + TEST_TEMPERATURE) + Math.log(humidity / 100);
-        const newDew = (237.7 * alpha) / (17.27 - alpha);
+        let newDew;
+        let dewSource;
+        if (Number.isFinite(providerCurrentWeather.temperatureDewPoint)) {
+            newDew = providerCurrentWeather.temperatureDewPoint;
+            dewSource = "provider";
+        } else {
+            const alpha = (17.27 * newTemp) / (237.7 + newTemp) + Math.log(humidity / 100);
+            newDew = (237.7 * alpha) / (17.27 - alpha);
+            dewSource = "magnus";
+        }
         const modified = new Uint8Array(rawBody);
         const view = new DataView(modified.buffer, modified.byteOffset, modified.byteLength);
-        view.setFloat32(tablePos + tempOffset, TEST_TEMPERATURE, true);
-        view.setFloat32(tablePos + apparentOffset, TEST_TEMPERATURE, true);
+        view.setFloat32(tablePos + tempOffset, newTemp, true);
+        view.setFloat32(tablePos + apparentOffset, newApparent, true);
         view.setFloat32(tablePos + dewOffset, newDew, true);
-        return { body: modified, log: `WK3 cwReplace: temp ${oldTemp.toFixed(2)}->${TEST_TEMPERATURE.toFixed(2)} apparent ${oldApparent.toFixed(2)}->${TEST_TEMPERATURE.toFixed(2)} dew ${oldDew.toFixed(2)}->${newDew.toFixed(2)} humidity ${humidity}` };
+        return { body: modified, log: `WK3 cwReplace: provider ${providerName} temp ${oldTemp.toFixed(2)}->${newTemp.toFixed(2)} apparent ${oldApparent.toFixed(2)}->${newApparent.toFixed(2)} dew ${oldDew.toFixed(2)}->${newDew.toFixed(2)} (${dewSource}) humidity ${humidity}` };
     } catch (error) {
         return { body: null, log: `WK3 cwReplace: skipped (${error?.message ?? error})` };
     }
