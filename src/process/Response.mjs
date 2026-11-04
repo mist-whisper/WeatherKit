@@ -93,12 +93,17 @@ export async function Response($request, $response) {
                             // 而不是假装修复。完整修复需要先拿到 WK3 的 root slot 映射，见 docs/wk3-ios27.3-experiment.md。
                             if (url.pathname.startsWith("/api/v3/weather/")) {
                                 const parameters = parseWeatherKitURL(url);
+                                const slotLines = dumpWK3Root(ByteBuffer, rawBody.length);
                                 Console.warn(
-                                    "WK3 weather response passthrough (experiment, not a fix)",
+                                    "WK3 weather response passthrough (experiment, not a fix) [probe v2: log only, body unchanged]",
                                     `messageType: ${$response.headers?.["Content-Type"] ?? $response.headers?.["content-type"]}`,
-                                    `schema-version: ${$response.headers?.["x-schema-version"] ?? $response.headers?.["X-Schema-Version"]}`,
+                                    // v1 探针读响应头得到 undefined 是取错了地方：schema 版本在请求头里，
+                                    // 响应头里没有这个字段，所以 v2 两边都记，互相对照。
+                                    `schema-version(response): ${$response.headers?.["x-schema-version"] ?? $response.headers?.["X-Schema-Version"]}`,
+                                    `schema-version(request): ${$request.headers?.["x-schema-version"] ?? $request.headers?.["X-Schema-Version"]}`,
                                     `dataSets: ${parameters.dataSets.join(",")}`,
                                     `country: ${parameters.country}`,
+                                    ...slotLines,
                                 );
                                 break;
                             }
@@ -170,6 +175,65 @@ export async function Response($request, $response) {
         }
     }
     return $response;
+}
+
+/**
+ * WK3 实验探针 v2：只读根表槽位清单，不解码、不重编码、不改包体。
+ * 只用 FlatBuffer 的 vtable 读槽位在不在、子表字段数、子表直接字符串字段；
+ * 不调用 WeatherKit2.decode / encode，不写 $response.body，失败时只记一行错误就透传。
+ * 子表字符串只取直接字段（如 AirQuality 的 scale、Alerts 的 detailsUrl），不递归展开；
+ * 向量长度不通用推断，避免把标量字段误读成向量长度，只靠字段数与字符串锚定认槽位。
+ * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
+ * @param {number} rawBodyLength - 原始包体字节数，用于越界保护
+ * @returns {string[]} 日志行
+ */
+function dumpWK3Root(ByteBuffer, rawBodyLength) {
+    try {
+        const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
+        const vtablePos = rootPos - ByteBuffer.readInt32(rootPos);
+        const vtableLength = ByteBuffer.readUint16(vtablePos);
+        const fieldCount = Math.floor((vtableLength - 4) / 2);
+        if (vtableLength < 4 || fieldCount <= 0 || fieldCount > 64) {
+            return [`WK3 slot dump failed: unexpected root vtable length ${vtableLength}`];
+        }
+        const lines = [`WK3 root: fields=${fieldCount} bodyLength=${rawBodyLength}`];
+        for (let slot = 0; slot < fieldCount; slot++) {
+            const fieldOffset = ByteBuffer.__offset(rootPos, 4 + slot * 2);
+            if (!fieldOffset) {
+                lines.push(`WK3 slot ${slot}: absent`);
+                continue;
+            }
+            const tablePos = ByteBuffer.__indirect(rootPos + fieldOffset);
+            if (tablePos < 0 || tablePos >= rawBodyLength) {
+                lines.push(`WK3 slot ${slot}: out-of-range table`);
+                continue;
+            }
+            const subVtablePos = tablePos - ByteBuffer.readInt32(tablePos);
+            const subVtableLength = ByteBuffer.readUint16(subVtablePos);
+            const subFieldCount = Math.floor((subVtableLength - 4) / 2);
+            if (subVtableLength < 4 || subFieldCount <= 0 || subFieldCount > 64) {
+                lines.push(`WK3 slot ${slot}: unexpected subtable vtable length ${subVtableLength}`);
+                continue;
+            }
+            const strings = [];
+            for (let sub = 0; sub < subFieldCount && strings.length < 3; sub++) {
+                const subOffset = ByteBuffer.__offset(tablePos, 4 + sub * 2);
+                if (!subOffset) continue;
+                try {
+                    const value = ByteBuffer.__string(tablePos + subOffset);
+                    if (typeof value === "string" && value.length > 0 && value.length <= 200 && !value.includes("�") && [...value].every(ch => ch.codePointAt(0) >= 32)) {
+                        strings.push(value.slice(0, 120));
+                    }
+                } catch {
+                    // 非字符串字段按 __string 读会失败或出乱码，直接跳过，不影响透传。
+                }
+            }
+            lines.push(`WK3 slot ${slot}: fields=${subFieldCount}${strings.length ? ` strings=[${strings.join(" | ")}]` : ""}`);
+        }
+        return lines;
+    } catch (error) {
+        return [`WK3 slot dump failed: ${error?.message ?? error}`];
+    }
 }
 
 /**

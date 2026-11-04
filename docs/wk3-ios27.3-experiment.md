@@ -94,3 +94,22 @@ Authorization 令牌。本页只保留了脱敏后的 URL、响应头名和包�
   还是修 lockfile / .npmrc 一致性），不要原样带进上游 PR。
 - 注意：改完工作流文件后，直接 Re-run 旧 run 仍用旧工作流文件，
   必须删掉重建 v3.3.3-beta1（或推新 tag）才能测到新工作流。
+
+## 探针 v2（2026-11-04，只记日志、不改数据）
+
+- 仍是透传：不调用 WeatherKit2.decode / encode，不写 `$response.body`，
+  包体原样还给天气 App；dump 本身包在 try/catch 里，失败也只记一行错误就透传。
+- 在 v1 日志基础上新增：
+  - `schema-version(request)` 与 `schema-version(response)` 两边都记。
+    v1 只记响应头得到 undefined，是取错了地方：schema 版本在请求头里。
+  - `WK3 root: fields=<根表字段数> bodyLength=<包体字节数>`。
+  - 每个根槽位一行：`WK3 slot <n>: absent`，或
+    `WK3 slot <n>: fields=<子表字段数> strings=[...]`。
+    字符串只取子表的直接字符串字段（如 AirQuality 的 scale、Alerts 的
+    detailsUrl），每槽最多 3 条、每条截断到 120 字，不递归展开；
+    向量长度不通用推断，避免把标量字段误读成向量。
+- 预期日志示例（以 2026-11-04 上午包体推断，实测以真机日志为准）：
+  slot0 应为 fields=8 且 strings 里有 scale（如 HJ6332012.2604），
+  slot9 应为 fields=3 且 strings 里有 alertDetails 链接，
+  slot7 应为 fields=4（WeatherChanges，时间戳字段不直接显示为字符串）。
+- 本探针不证明 WK3 解码正确，只提供槽位清单，供离线对照 WK2 映射使用。

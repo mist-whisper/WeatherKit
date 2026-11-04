@@ -22,6 +22,18 @@ test("Response 对 v3 只做透传探针，不走 WK2 解码", () => {
     assert.match(response, /WK3 weather response passthrough \(experiment, not a fix\)/);
 });
 
+test("Probe v2 只记槽位清单、不改包体，schema 版本取请求头", () => {
+    assert.match(response, /dumpWK3Root\(ByteBuffer, rawBody\.length\)/);
+    assert.match(response, /schema-version\(request\)/);
+    assert.match(response, /schema-version\(response\)/);
+    // v3 分支内不得出现 WK2 解码/编码，也不得写 $response.body。
+    const v3Start = response.indexOf('startsWith("/api/v3/weather/")');
+    const v2Start = response.indexOf('startsWith("/api/v2/weather/")', v3Start);
+    const v3Block = response.slice(v3Start, v2Start);
+    assert.doesNotMatch(v3Block, /WeatherKit2\.decode|WeatherKit2\.encode/);
+    assert.doesNotMatch(v3Block, /\$response\.body\s*=/);
+});
+
 test("Request 对 v3 沿用 v2 的 country 补齐分支", () => {
     assert.match(request, /startsWith\("\/api\/v3\/weather\/"\)/);
 });
