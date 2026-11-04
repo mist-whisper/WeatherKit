@@ -64,6 +64,7 @@ test("AQ overlay：新 AQ 表 + 其余槽位 opaque 保留，失败原样返回�
     assert.match(response, /opaque slots preserved/);
     assert.match(response, /self-check/);
     assert.doesNotMatch(response, /TEST\.WK3\.00001/);
+    assert.doesNotMatch(response, /Algorithm: "EU_EAQI"/);
     // v3 分支内不得出现 WK2 解码/编码，也不得写 $response.body。
     const v3Start = response.indexOf('startsWith("/api/v3/weather/")');
     const v2Start = response.indexOf('startsWith("/api/v2/weather/")', v3Start);
@@ -72,12 +73,15 @@ test("AQ overlay：新 AQ 表 + 其余槽位 opaque 保留，失败原样返回�
     assert.doesNotMatch(v3Block, /\$response\.body\s*=/);
 });
 
-test("AQ 欧标全套：原污染物按 EU_EAQI 计算，一起换 category / index / 主污染物 / scale，昨日对比不动", () => {
-    assert.match(response, /function calculateWK3AQEU/);
+test("AQ 全套跟随设置：算法/国家/scale 门均跟 Settings，单位字节 2 按微克计入计算", () => {
+    assert.match(response, /function calculateWK3AQ/);
     assert.match(response, /Pollutants2AQI/);
-    assert.match(response, /EU_EAQI/);
-    assert.match(response, /WK3 aqEU:/);
+    assert.match(response, /Index\?\.Replace/);
+    assert.match(response, /Weather\?\.Replace/);
+    assert.match(response, /Calculate\?\.Algorithm/);
+    assert.match(response, /WK3 aq:/);
     assert.doesNotMatch(response, /TEST\.WK3\.00001/);
+    assert.doesNotMatch(response, /Algorithm: "EU_EAQI"/);
     // v3 分支内不得出现 WK2 解码/编码，也不得写 $response.body。
     const v3Start = response.indexOf('startsWith("/api/v3/weather/")');
     const v2Start = response.indexOf('startsWith("/api/v2/weather/")', v3Start);

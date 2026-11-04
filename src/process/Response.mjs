@@ -116,15 +116,16 @@ export async function Response($request, $response) {
                                             break;
                                     }
                                 }
-                                // AQ 全套（欧标）：用原污染物按 EU_EAQI 算指数，一起换
+                                // AQ 全套（跟随设置）：用原污染物按设置的算法算指数，一起换
                                 // category / index / 主污染物 / scale 串，昨日对比保持原值，
                                 // 污染物空了不补（先只做污染物本来就有的城市）；失败则
-                                // 原样返回，不影响 CW。
-                                const aqEU = calculateWK3AQEU(ByteBuffer, rawBody, parameters.country, Settings);
+                                // 原样返回，不影响 CW。国家门跟 Weather.Replace，
+                                // scale 门跟 AirQuality.Current.Index.Replace。
+                                const aqReplace = calculateWK3AQ(ByteBuffer, rawBody, parameters.country, Settings);
                                 let workingBody = rawBody;
                                 let workingByteBuffer = ByteBuffer;
-                                if (aqEU.body) {
-                                    workingBody = aqEU.body;
+                                if (aqReplace.body) {
+                                    workingBody = aqReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
                                 const cwReplace = replaceWK3CWTemperature(workingByteBuffer, workingBody, parameters.country, Settings?.Weather?.Provider, providerCurrentWeather);
@@ -140,7 +141,7 @@ export async function Response($request, $response) {
                                     `dataSets: ${parameters.dataSets.join(",")}`,
                                     `country: ${parameters.country}`,
                                     ...slotLines,
-                                    aqEU.log,
+                                    aqReplace.log,
                                     cwReplace.log,
                                 );
                                 break;
@@ -261,35 +262,44 @@ export async function Response($request, $response) {
  * @returns {{body: Uint8Array | null, log: string}}
  */
 /**
- * WK3 AQ 欧标全套：用原污染物按 EU_EAQI 算指数，一起换 category /
+ * WK3 AQ 全套（跟随设置）：用原污染物按设置的算法算指数，一起换 category /
  * index / 主污染物 / scale 串，昨日对比保持原值，污染物空了不补
  * （先只做污染物本来就有的城市），元数据与污染物向量保持原样。
+ * 门全部跟随设置，不再写死：国家门跟 Settings.Weather.Replace
+ * （默认 ["CN"]），scale 门跟 Settings.AirQuality.Current.Index.Replace
+ * （默认 ["HJ6332012"]），算法跟 Settings.AirQuality.Calculate.Algorithm
+ * （缺省时默认 EU_EAQI，与 beta8 一致）；算法为 None 时不换。
  * 解码沿用 WK2 的 AQ / 污染物字段顺序（已在北京、东京两体上核对：
  * AQ 字段1 category、字段2 index、字段7 scale；污染物字段0 类型、
  * 字段1 浓度、字段2 单位）。注意：不跑 FixPollutantsUnits，因为
  * 苹果原污染物已是 WeatherKit 单位，Fix 只针对插件自己注入的
  * 和风污染物；对原数据跑 Fix 会把 CO 从 µg 误当 mg 再乘 1000。
- * 计算强制用 EU_EAQI（不跟随用户 Settings 的算法设置），因为
- * 本次实验的约定就是先算欧标；污染物类型 / 单位枚举沿用 WK2，
- * 单位字节 2（WK2 里叫 UNKNOWN2）在计算里按原量处理——
- * ConvertUnit 不支持它时会原样返回，浓度本身已是 µg 量级，
- * 指数计算不受影响。任一校验失败都原样返回。
+ * 单位字节 2 的映射是推断（未实证）：WK2 里它叫 UNKNOWN2，但
+ * 原污染物浓度本身已是 µg 量级（CO 220、PM2.5 38 等），且欧标
+ * 全是 µg 目标时按原量算结果正确；此处把它当作微克喂给计算，
+ * 这样美标气体才能从微克正确换算成 ppb；若该推断错，美标气体
+ * 指数会系统性偏离，需装机对照验证。污染物向量本身仍保持原样
+ * （显示层面的单位与换算后浓度未重建，属后续步骤）。
+ * 任一校验失败都原样返回。
  * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
  * @param {Uint8Array} rawBody - 原始包体
  * @param {string} country - 请求的 country 参数
- * @param {any} Settings - 插件 Settings（仅取其余配置，算法强制 EU_EAQI）
+ * @param {any} Settings - 插件 Settings
  * @returns {{body: Uint8Array | null, log: string}}
  */
-function calculateWK3AQEU(ByteBuffer, rawBody, country, Settings) {
+function calculateWK3AQ(ByteBuffer, rawBody, country, Settings) {
     try {
-        if (country !== "CN") return { body: null, log: "WK3 aqEU: skipped (country != CN)" };
+        const replaceCountries = Settings?.Weather?.Replace ?? ["CN"];
+        if (!replaceCountries.includes(country)) return { body: null, log: `WK3 aq: skipped (country ${country} not in Weather.Replace)` };
+        const algorithm = Settings?.AirQuality?.Calculate?.Algorithm ?? "EU_EAQI";
+        if (algorithm === "None") return { body: null, log: "WK3 aq: skipped (algorithm None)" };
         const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
-        if (rootPos < 0 || rootPos + 4 > rawBody.length) return { body: null, log: "WK3 aqEU: skipped (root out of range)" };
+        if (rootPos < 0 || rootPos + 4 > rawBody.length) return { body: null, log: "WK3 aq: skipped (root out of range)" };
         const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
         const rootFieldCount = Math.floor((ByteBuffer.readUint16(rootVtablePos) - 4) / 2);
-        if (rootFieldCount !== 15) return { body: null, log: `WK3 aqEU: skipped (unexpected root fields=${rootFieldCount})` };
+        if (rootFieldCount !== 15) return { body: null, log: `WK3 aq: skipped (unexpected root fields=${rootFieldCount})` };
         const slot0Offset = ByteBuffer.__offset(rootPos, 4);
-        if (!slot0Offset) return { body: null, log: "WK3 aqEU: skipped (slot 0 absent)" };
+        if (!slot0Offset) return { body: null, log: "WK3 aq: skipped (slot 0 absent)" };
         const aqPos = ByteBuffer.__indirect(rootPos + slot0Offset);
         const aqMetaOffset = ByteBuffer.__offset(aqPos, 4);
         const aqCategoryOffset = ByteBuffer.__offset(aqPos, 6);
@@ -297,11 +307,12 @@ function calculateWK3AQEU(ByteBuffer, rawBody, country, Settings) {
         const aqPollutantsOffset = ByteBuffer.__offset(aqPos, 12);
         const aqScaleOffset = ByteBuffer.__offset(aqPos, 18);
         if (!aqMetaOffset || !aqCategoryOffset || !aqIndexOffset || !aqPollutantsOffset || !aqScaleOffset) {
-            return { body: null, log: "WK3 aqEU: skipped (AQ field absent)" };
+            return { body: null, log: "WK3 aq: skipped (AQ field absent)" };
         }
         const oldScale = ByteBuffer.__string(aqPos + aqScaleOffset);
-        if (!AirQuality.ScaleMatches(oldScale, "HJ6332012")) {
-            return { body: null, log: `WK3 aqEU: skipped (scale mismatch: ${oldScale})` };
+        const replaceScales = Settings?.AirQuality?.Current?.Index?.Replace ?? ["HJ6332012"];
+        if (!replaceScales.some(scaleName => AirQuality.ScaleMatches(oldScale, scaleName))) {
+            return { body: null, log: `WK3 aq: skipped (scale ${oldScale} not in Index.Replace)` };
         }
         const oldCategory = ByteBuffer.readInt8(aqPos + aqCategoryOffset);
         const oldIndex = ByteBuffer.readInt16(aqPos + aqIndexOffset);
@@ -309,53 +320,55 @@ function calculateWK3AQEU(ByteBuffer, rawBody, country, Settings) {
         const metaProviderOffset = ByteBuffer.__offset(metaPos, 16);
         const providerName = metaProviderOffset ? ByteBuffer.__string(metaPos + metaProviderOffset) : "";
         const vecPos = ByteBuffer.__indirect(aqPos + aqPollutantsOffset);
-        if (vecPos < 0 || vecPos + 4 > rawBody.length) return { body: null, log: "WK3 aqEU: skipped (pollutants vector out of range)" };
+        if (vecPos < 0 || vecPos + 4 > rawBody.length) return { body: null, log: "WK3 aq: skipped (pollutants vector out of range)" };
         const vecLen = ByteBuffer.readInt32(vecPos);
-        if (vecLen <= 0 || vecLen > 20) return { body: null, log: `WK3 aqEU: skipped (pollutants empty or too many: ${vecLen})` };
+        if (vecLen <= 0 || vecLen > 20) return { body: null, log: `WK3 aq: skipped (pollutants empty or too many: ${vecLen})` };
         const pollutantTypes = ["NOT_AVAILABLE", "C6H6", "NH3", "NMHC", "NO", "NO2", "NOX", "OZONE", "PM2_5", "SO2", "PM10", "CO", "UNKNOWN12", "UNKNOWN13"];
-        const unitTypes = ["PARTS_PER_BILLION", "MICROGRAMS_PER_CUBIC_METER", "UNKNOWN2", "UNKNOWN3"];
+        // WK2 的单位枚举：0 ppb、1 µg、2 UNKNOWN2、3 UNKNOWN3。WK3 原包体里
+        // 大量出现单位字节 2，且浓度是 µg 量级，故计算时把它当作微克（推断，见函数注释）。
+        const unitTypes = ["PARTS_PER_BILLION", "MICROGRAMS_PER_CUBIC_METER", "MICROGRAMS_PER_CUBIC_METER", "UNKNOWN3"];
         const pollutants = [];
         for (let i = 0; i < vecLen; i++) {
             const elemPos = ByteBuffer.__indirect(vecPos + 4 + i * 4);
             const typeOffset = ByteBuffer.__offset(elemPos, 4);
             const amountOffset = ByteBuffer.__offset(elemPos, 6);
             const unitsOffset = ByteBuffer.__offset(elemPos, 8);
-            if (!typeOffset || !amountOffset || !unitsOffset) return { body: null, log: `WK3 aqEU: skipped (pollutant ${i} field absent)` };
+            if (!typeOffset || !amountOffset || !unitsOffset) return { body: null, log: `WK3 aq: skipped (pollutant ${i} field absent)` };
             const typeByte = ByteBuffer.readInt8(elemPos + typeOffset);
             const amount = ByteBuffer.readFloat32(elemPos + amountOffset);
             const unitsByte = ByteBuffer.readInt8(elemPos + unitsOffset);
-            if (!Number.isFinite(amount) || amount < 0) return { body: null, log: `WK3 aqEU: skipped (pollutant ${i} amount invalid)` };
+            if (!Number.isFinite(amount) || amount < 0) return { body: null, log: `WK3 aq: skipped (pollutant ${i} amount invalid)` };
             pollutants.push({ pollutantType: pollutantTypes[typeByte] ?? "UNKNOWN", amount, units: unitTypes[unitsByte] ?? "UNKNOWN" });
         }
-        const forcedSettings = {
+        const effectiveSettings = {
             ...Settings,
-            AirQuality: { ...(Settings?.AirQuality ?? {}), Calculate: { ...(Settings?.AirQuality?.Calculate ?? {}), Algorithm: "EU_EAQI" } },
+            AirQuality: { ...(Settings?.AirQuality ?? {}), Calculate: { ...(Settings?.AirQuality?.Calculate ?? {}), Algorithm: algorithm } },
         };
-        const calculated = AirQuality.Pollutants2AQI({ pollutants, metadata: { providerName } }, forcedSettings);
-        if (!Number.isFinite(calculated?.index) || calculated.index < 0 || !Number.isFinite(calculated?.categoryIndex) || calculated.categoryIndex < 1 || calculated.categoryIndex > 6) {
-            return { body: null, log: `WK3 aqEU: skipped (calculation invalid: index=${calculated?.index} category=${calculated?.categoryIndex})` };
+        const calculated = AirQuality.Pollutants2AQI({ pollutants, metadata: { providerName } }, effectiveSettings);
+        if (!Number.isFinite(calculated?.index) || calculated.index < 0 || !Number.isFinite(calculated?.categoryIndex) || calculated.categoryIndex < 1 || calculated.categoryIndex > 10) {
+            return { body: null, log: `WK3 aq: skipped (calculation invalid: index=${calculated?.index} category=${calculated?.categoryIndex})` };
         }
         const primaryEnum = pollutantTypes.indexOf(calculated.primaryPollutant);
-        if (primaryEnum < 0) return { body: null, log: `WK3 aqEU: skipped (primary pollutant unknown: ${calculated.primaryPollutant})` };
+        if (primaryEnum < 0) return { body: null, log: `WK3 aq: skipped (primary pollutant unknown: ${calculated.primaryPollutant})` };
         const perPollutant = (calculated.pollutants ?? []).map(p => `${p.pollutantType}=${Number.isFinite(p.index) ? p.index.toFixed(2) : p.index}`).join(" ");
         const overlay = overlayWK3AQ(ByteBuffer, rawBody, country, calculated.categoryIndex, Math.round(calculated.index), {
             scale: calculated.scale,
             primaryEnum,
             isSignificant: calculated.isSignificant,
         });
-        if (!overlay.body) return { body: null, log: `WK3 aqEU: overlay failed (${overlay.log})` };
+        if (!overlay.body) return { body: null, log: `WK3 aq: overlay failed (${overlay.log})` };
         return {
             body: overlay.body,
-            log: `WK3 aqEU: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${calculated.scale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (EU_EAQI, comparison unchanged)`,
+            log: `WK3 aq: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${calculated.scale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (comparison unchanged, pollutants vector unchanged)`,
         };
     } catch (error) {
-        return { body: null, log: `WK3 aqEU: skipped (${error?.message ?? error})` };
+        return { body: null, log: `WK3 aq: skipped (${error?.message ?? error})` };
     }
 }
 
 function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, options = {}) {
     try {
-        if (country !== "CN") return { body: null, log: "WK3 aqOverlay: skipped (country != CN)" };
+        // overlay 本身不设国家/scale 门，门由调用方（calculateWK3AQ）按设置把关。
         // options.scale：不传或与原 scale 相同则 scale 串指向 blob 原串；
         // 传新串则在新 AQ 表后新建一个字符串对象，scale 字段指向它。
         // options.primaryEnum / options.isSignificant：不传则保持原字节。
@@ -387,9 +400,6 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
             return { body: null, log: "WK3 aqOverlay: skipped (AQ field absent)" };
         }
         const scale = ByteBuffer.__string(aqPos + aqScaleOffset);
-        if (!AirQuality.ScaleMatches(scale, "HJ6332012")) {
-            return { body: null, log: `WK3 aqOverlay: skipped (scale mismatch: ${scale})` };
-        }
         const newScale = typeof options.scale === "string" && options.scale.length > 0 ? options.scale : scale;
         const oldCategory = ByteBuffer.readInt8(aqPos + aqCategoryOffset);
         const oldIndex = ByteBuffer.readInt16(aqPos + aqIndexOffset);
