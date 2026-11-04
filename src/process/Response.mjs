@@ -117,11 +117,18 @@ export async function Response($request, $response) {
                                     }
                                 }
                                 // AQ 全套（跟随设置）：用原污染物按设置的算法算指数，一起换
-                                // category / index / 主污染物 / scale 串，昨日对比保持原值，
-                                // 污染物空了不补（先只做污染物本来就有的城市）；失败则
-                                // 原样返回，不影响 CW。国家门跟 Weather.Replace，
-                                // scale 门跟 AirQuality.Current.Index.Replace。
-                                const aqReplace = calculateWK3AQ(ByteBuffer, rawBody, parameters.country, Settings);
+                                // category / index / 主污染物 / scale 串；昨日对比在原值
+                                // UNKNOWN（或 ReplaceWhenCurrentChange）时按 v2 逻辑重算
+                                // （默认走彩云昨日/今日美标或国标对比），元数据拼接
+                                // providerName；污染物空了不补（先只做污染物本来就有
+                                // 的城市）；对比或元数据任一失败只退回原值，不影响
+                                // 指数替换与 CW。国家门跟 Weather.Replace，scale 门跟
+                                // AirQuality.Current.Index.Replace。
+                                let aqComparisonEnv = null;
+                                if (Settings?.Weather?.Replace?.includes(parameters.country)) {
+                                    aqComparisonEnv = new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ==");
+                                }
+                                const aqReplace = await calculateWK3AQ(ByteBuffer, rawBody, parameters.country, Settings, aqComparisonEnv);
                                 let workingBody = rawBody;
                                 let workingByteBuffer = ByteBuffer;
                                 if (aqReplace.body) {
@@ -292,7 +299,7 @@ export async function Response($request, $response) {
  * @param {any} Settings - 插件 Settings
  * @returns {{body: Uint8Array | null, log: string}}
  */
-function calculateWK3AQ(ByteBuffer, rawBody, country, Settings) {
+async function calculateWK3AQ(ByteBuffer, rawBody, country, Settings, colorfulClouds = null) {
     try {
         const replaceCountries = Settings?.Weather?.Replace ?? ["CN"];
         if (!replaceCountries.includes(country)) return { body: null, log: `WK3 aq: skipped (country ${country} not in Weather.Replace)` };
@@ -383,16 +390,86 @@ function calculateWK3AQ(ByteBuffer, rawBody, country, Settings) {
         // EPA_NowCast.2604），而 HK.AQHI 本地定义的 version 为 1，故试写带版本的
         // HK.AQHI.1；其余标准不动。CN.AQHI 同理但本探针只动 HK 代表。
         const probeScale = calculated.scale === "HK.AQHI" ? "HK.AQHI.1" : calculated.scale;
+        // 昨日对比（v2 Step 4 逻辑的 WK3 版）与元数据拼接（v2 Step 5）。
+        // ComparisonTrend 字节映射取自 3.2 bundle 内生成枚举（已核实）：
+        // UNKNOWN 0、MUCH_WORSE 1、WORSE 2、SAME 3、BETTER 4、MUCH_BETTER 5；
+        // JS 比较只产出 UNKNOWN/WORSE/SAME/BETTER 四种。
+        const COMPARISON_BYTE_BY_TREND = { UNKNOWN: 0, WORSE: 2, SAME: 3, BETTER: 4 };
+        const COMPARISON_TREND_BY_BYTE = { 0: "UNKNOWN", 1: "MUCH_WORSE", 2: "WORSE", 3: "SAME", 4: "BETTER", 5: "MUCH_BETTER" };
+        const aqComparisonOffset = ByteBuffer.__offset(aqPos, 14);
+        const origComparisonByte = aqComparisonOffset ? ByteBuffer.readInt8(aqPos + aqComparisonOffset) : -1;
+        const origComparisonStr = COMPARISON_TREND_BY_BYTE[origComparisonByte] ?? "UNKNOWN";
+        // 注意：原值 UNKNOWN 时字段常因默认值被省略（北京体实测字段 5
+        // 的 vtable 槽位为 0），故“字段缺失”即 UNKNOWN、同样需要计算；
+        // 写回时由 overlay 以 vtable 槽位 + 表尾追加字节补位。
+        const needComputeComparison = origComparisonStr === "UNKNOWN" || Settings?.AirQuality?.Comparison?.ReplaceWhenCurrentChange === true;
+        let comparisonByte = null;
+        let comparisonLine = null;
+        let comparisonLog = "comparison unchanged";
+        if (needComputeComparison) {
+            // 默认昨日指数源为 ColorfulCloudsUS；国标源为 ColorfulCloudsCN；
+            // 其余昨日源（QWeather/Calculate）在 WK3 暂不接线，失败只退回原值。
+            const yesterdayProvider = Settings?.AirQuality?.Comparison?.Yesterday?.IndexProvider ?? "ColorfulCloudsUS";
+            const useUsa = yesterdayProvider !== "ColorfulCloudsCN";
+            if (!colorfulClouds) {
+                comparisonLog = "comparison skipped (no colorfulClouds env)";
+            } else if (yesterdayProvider !== "ColorfulCloudsUS" && yesterdayProvider !== "ColorfulCloudsCN") {
+                comparisonLog = `comparison skipped (yesterday provider ${yesterdayProvider} not wired in WK3)`;
+            } else {
+                try {
+                    const currentIndexProvider = Settings?.AirQuality?.Current?.Index?.Provider ?? "Calculate";
+                    const isHj = currentIndexProvider === "Calculate"
+                        ? Settings?.AirQuality?.Calculate?.Algorithm === "WAQI_InstantCast_CN"
+                        : (currentIndexProvider === "QWeather" || currentIndexProvider === "ColorfulCloudsCN");
+                    const isEpa = currentIndexProvider === "WAQI" || currentIndexProvider === "ColorfulCloudsUS";
+                    const todayCatFromInjected = yesterdayProvider === "ColorfulCloudsCN" ? (isHj ? calculated.categoryIndex : undefined) : (isEpa ? calculated.categoryIndex : undefined);
+                    const yesterday = await colorfulClouds.YesterdayAirQuality(useUsa);
+                    if (yesterday?.metadata?.temporarilyUnavailable || !Number.isFinite(yesterday?.categoryIndex)) {
+                        comparisonLog = "comparison skipped (yesterday unavailable)";
+                    } else {
+                        let todayCat = todayCatFromInjected;
+                        if (todayCat === undefined) {
+                            const ccCurrent = await colorfulClouds.CurrentAirQuality(useUsa);
+                            if (ccCurrent?.metadata?.temporarilyUnavailable || !Number.isFinite(ccCurrent?.categoryIndex)) {
+                                comparisonLog = "comparison skipped (current unavailable)";
+                                todayCat = null;
+                            } else {
+                                todayCat = ccCurrent.categoryIndex;
+                            }
+                        }
+                        if (todayCat !== undefined && todayCat !== null) {
+                            const trend = AirQuality.CompareCategoryIndexes(todayCat, yesterday.categoryIndex);
+                            comparisonByte = COMPARISON_BYTE_BY_TREND[trend] ?? 0;
+                            comparisonLine = `对比昨日：\n指数：${AirQuality.appendScaleToProviderName({ metadata: yesterday.metadata, scale: yesterday.scale }, Settings)}`;
+                            comparisonLog = `comparison ${origComparisonStr}->${trend} (CC today ${todayCat} vs yesterday ${yesterday.categoryIndex})`;
+                        }
+                    }
+                } catch (error) {
+                    comparisonLog = `comparison skipped (${error?.message ?? error})`;
+                }
+            }
+        }
+        // 元数据拼接（v2 Step 5）：原 provider + 指数行 + 对比行；logo 保持原值
+        // （首个有效 provider 即原 provider），故不重建 logo 字段。
+        const indexLine = `指数：${AirQuality.appendScaleToProviderName({ metadata: { providerName: "iRingo" }, scale: probeScale }, Settings)}`;
+        const providerLines = [];
+        if (providerName) providerLines.push(providerName);
+        providerLines.push(indexLine);
+        if (comparisonLine) providerLines.push(comparisonLine);
+        const joinedProviderName = providerLines.join("\n");
+        const metadataProviderName = joinedProviderName !== providerName ? joinedProviderName : null;
         const overlay = overlayWK3AQ(ByteBuffer, rawBody, country, calculated.categoryIndex, Math.round(calculated.index), {
             scale: probeScale,
             primaryEnum,
             isSignificant: calculated.isSignificant,
             pollutants: newPollutants,
+            comparisonByte,
+            metadataProviderName,
         });
         if (!overlay.body) return { body: null, log: `WK3 aq: overlay failed (${overlay.log})` };
         return {
             body: overlay.body,
-            log: `WK3 aq: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${probeScale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (comparison unchanged, pollutants vector rebuilt: ${changedDesc || "no changes"})`,
+            log: `WK3 aq: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${probeScale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (pollutants vector rebuilt: ${changedDesc || "no changes"}) [${comparisonLog}] [metadata: ${metadataProviderName ? "providerName spliced" : "unchanged"}]`,
         };
     } catch (error) {
         return { body: null, log: `WK3 aq: skipped (${error?.message ?? error})` };
@@ -447,10 +524,51 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
         const newRootPos = align4(newRootVtablePos + rootVtableLen);
         const newAqVtablePos = align4(newRootPos + rootTableSize);
         const newAqPos = newAqVtablePos + aqVtableLen;
+        // 昨日对比字段（字段 5）缺失时（原值 UNKNOWN 被默认值省略），
+        // 不能原位改写：改 vtable——表长 +1、字段 5 槽位置为原表长，
+        // 并在表尾追加一个字节放对比值；其余字段偏移一律不动。
+        const comparisonExtendsTable = Number.isInteger(options.comparisonByte) && !ByteBuffer.__offset(aqPos, 14);
+        const newAqTableSize = aqTableSize + (comparisonExtendsTable ? 1 : 0);
         const scaleChanged = newScale !== scale;
         const newScaleBytes = scaleChanged ? new TextEncoder().encode(newScale) : null;
-        const newScalePos = scaleChanged ? align4(newAqPos + aqTableSize) : null;
+        const newScalePos = scaleChanged ? align4(newAqPos + newAqTableSize) : null;
         const newScaleSize = scaleChanged ? align4(4 + newScaleBytes.length) : 0;
+        // 元数据重建：新布局在 scale 串之后依次放元数据 vtable、元数据表、
+        // providerName 新串。元数据表沿用原表字节模板（标量原样保留），
+        // 只重算偏移字段：0/2/5 指向 blob 原对象，6（providerName）指向
+        // 新串。北京体实测元数据表 11 字段、标量最大 4 字节（经纬度为
+        // float32），表起址仍按 8 对齐以容纳可能的 8 字节成员。
+        let rebuildMetadata = null;
+        let newMetaVtablePos = null;
+        let newMetaPos = null;
+        let newProviderNamePos = null;
+        if (typeof options.metadataProviderName === "string" && options.metadataProviderName.length > 0) {
+            const origMetaPos = ByteBuffer.__indirect(aqPos + aqMetaOffset);
+            const origMetaVtablePos = origMetaPos - ByteBuffer.readInt32(origMetaPos);
+            const metaVtableLen = ByteBuffer.readUint16(origMetaVtablePos);
+            const metaTableSize = ByteBuffer.readUint16(origMetaVtablePos + 2);
+            const metaFieldCount = Math.floor((metaVtableLen - 4) / 2);
+            if (metaFieldCount < 7 || metaTableSize <= 0 || metaTableSize > 256) {
+                return { body: null, log: `WK3 aqOverlay: skipped (unexpected metadata fields=${metaFieldCount} size=${metaTableSize})` };
+            }
+            const metaProviderOffset = ByteBuffer.__offset(origMetaPos, 16);
+            const origProviderName = metaProviderOffset ? ByteBuffer.__string(origMetaPos + metaProviderOffset) : "";
+            if (origProviderName !== options.metadataProviderName) {
+                const stringTargets = {};
+                for (const f of [0, 2, 5]) {
+                    const fo = ByteBuffer.__offset(origMetaPos, 4 + f * 2);
+                    if (fo) stringTargets[f] = { fieldOffset: fo, origTarget: ByteBuffer.__indirect(origMetaPos + fo) };
+                }
+                rebuildMetadata = {
+                    table: rawBody.subarray(origMetaPos, origMetaPos + metaTableSize),
+                    vtable: rawBody.subarray(origMetaVtablePos, origMetaVtablePos + metaVtableLen),
+                    vtableLen: metaVtableLen,
+                    tableSize: metaTableSize,
+                    stringTargets,
+                    providerFieldOffset: metaProviderOffset,
+                };
+            }
+        }
         // 污染物向量重建：新布局在 scale 串之后依次放污染物 vtable、
         // 各污染物表（沿用原表字节模板，只改三个标量）、新向量。
         // 任一前置校验失败都退回 blob 原向量（AQ 替换本身不受影响），
@@ -492,8 +610,26 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
         } catch {
             rebuildPollutants = null;
         }
-        let cursor = scaleChanged ? newScalePos + newScaleSize : newAqPos + aqTableSize;
+        let cursor = scaleChanged ? newScalePos + newScaleSize : newAqPos + newAqTableSize;
+        if (rebuildMetadata) {
+            newMetaVtablePos = align4(cursor);
+            cursor = newMetaVtablePos + rebuildMetadata.vtableLen;
+            newMetaPos = align8(cursor);
+            cursor = newMetaPos + rebuildMetadata.tableSize;
+            const providerNameBytes = new TextEncoder().encode(options.metadataProviderName);
+            newProviderNamePos = align4(cursor);
+            cursor = newProviderNamePos + align4(4 + providerNameBytes.length);
+            rebuildMetadata.providerNameBytes = providerNameBytes;
+        }
         if (rebuildPollutants) {
+            // 向量必须在表之前：FlatBuffers 的 uoffset 是无符号前向偏移，
+            // 元素偏移必须为正。beta10 把向量放在表之后，元素偏移成负值，
+            // 存为 uint32 后是 40 亿量级的越界数；JS 解析（有符号）能正常
+            // 读回故自检全过，苹果原生解析（无符号）则越界丢段——这就是
+            // beta10 新请求无段的机制。原体实测：向量在前、元素偏移全为
+            // +4…+120 的小正数；此处复现该排布。
+            newPolVecPos = align4(cursor);
+            cursor = newPolVecPos + 4 + rebuildPollutants.want.length * 4;
             for (let i = 0; i < rebuildPollutants.elems.length; i++) {
                 const vtablePos = align4(cursor);
                 newPolVtablePositions.push(vtablePos);
@@ -504,8 +640,6 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
                 newPolTablePositions.push(tablePos);
                 cursor = tablePos + rebuildPollutants.elems[i].tableSize;
             }
-            newPolVecPos = align4(cursor);
-            cursor = newPolVecPos + 4 + rebuildPollutants.want.length * 4;
         }
         const blobOffset = align8(cursor);
         const out = new Uint8Array(blobOffset + rawBody.length);
@@ -523,11 +657,20 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
             newRootView.setUint32(fieldOffset, value, true);
         }
         out.set(newRoot, newRootPos);
-        out.set(rawBody.subarray(aqVtablePos, aqVtablePos + aqVtableLen), newAqVtablePos);
-        const newAq = new Uint8Array(rawBody.subarray(aqPos, aqPos + aqTableSize));
+        const newAqVtable = new Uint8Array(rawBody.subarray(aqVtablePos, aqVtablePos + aqVtableLen));
+        if (comparisonExtendsTable) {
+            const newAqVtableView = new DataView(newAqVtable.buffer, newAqVtable.byteOffset, newAqVtable.byteLength);
+            newAqVtableView.setUint16(2, newAqTableSize, true);
+            newAqVtableView.setUint16(14, aqTableSize, true);
+        }
+        out.set(newAqVtable, newAqVtablePos);
+        const newAq = new Uint8Array(newAqTableSize);
+        newAq.set(rawBody.subarray(aqPos, aqPos + aqTableSize), 0);
         const newAqView = new DataView(newAq.buffer, newAq.byteOffset, newAq.byteLength);
         newAqView.setInt32(0, newAqPos - newAqVtablePos, true);
-        {
+        if (rebuildMetadata) {
+            newAqView.setUint32(aqMetaOffset, newMetaPos - (newAqPos + aqMetaOffset), true);
+        } else {
             const origTarget = ByteBuffer.__indirect(aqPos + aqMetaOffset);
             newAqView.setUint32(aqMetaOffset, origTarget + blobOffset - (newAqPos + aqMetaOffset), true);
         }
@@ -553,11 +696,35 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
         if (aqPrimaryOffset && Number.isInteger(options.primaryEnum)) {
             newAqView.setInt8(aqPrimaryOffset, options.primaryEnum);
         }
+        const aqComparisonWriteOffset = ByteBuffer.__offset(aqPos, 14);
+        if (Number.isInteger(options.comparisonByte)) {
+            if (aqComparisonWriteOffset) {
+                newAqView.setInt8(aqComparisonWriteOffset, options.comparisonByte);
+            } else if (comparisonExtendsTable) {
+                newAqView.setInt8(aqTableSize, options.comparisonByte);
+            }
+        }
         out.set(newAq, newAqPos);
         if (scaleChanged) {
             const scaleView = new DataView(out.buffer, out.byteOffset, out.byteLength);
             scaleView.setUint32(newScalePos, newScaleBytes.length, true);
             out.set(newScaleBytes, newScalePos + 4);
+        }
+        if (rebuildMetadata) {
+            out.set(rebuildMetadata.vtable, newMetaVtablePos);
+            out.set(rebuildMetadata.table, newMetaPos);
+            const metaView = new DataView(out.buffer, out.byteOffset + newMetaPos, rebuildMetadata.tableSize);
+            metaView.setInt32(0, newMetaPos - newMetaVtablePos, true);
+            for (const f of [0, 2, 5]) {
+                const entry = rebuildMetadata.stringTargets[f];
+                if (entry) metaView.setUint32(entry.fieldOffset, entry.origTarget + blobOffset - (newMetaPos + entry.fieldOffset), true);
+            }
+            if (rebuildMetadata.providerFieldOffset) {
+                metaView.setUint32(rebuildMetadata.providerFieldOffset, newProviderNamePos - (newMetaPos + rebuildMetadata.providerFieldOffset), true);
+            }
+            const providerNameView = new DataView(out.buffer, out.byteOffset, out.byteLength);
+            providerNameView.setUint32(newProviderNamePos, rebuildMetadata.providerNameBytes.length, true);
+            out.set(rebuildMetadata.providerNameBytes, newProviderNamePos + 4);
         }
         if (rebuildPollutants) {
             const outView = new DataView(out.buffer, out.byteOffset, out.byteLength);
@@ -600,10 +767,31 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
         if (checkBuffer.__string(checkAqPos + checkBuffer.__offset(checkAqPos, 18)) !== newScale) {
             return { body: null, log: "WK3 aqOverlay: skipped (self-check scale mismatch)" };
         }
+        if (Number.isInteger(options.comparisonByte)) {
+            const checkComparisonOffset = checkBuffer.__offset(checkAqPos, 14);
+            if (!checkComparisonOffset || checkBuffer.readInt8(checkAqPos + checkComparisonOffset) !== options.comparisonByte) {
+                return { body: null, log: "WK3 aqOverlay: skipped (self-check comparison mismatch)" };
+            }
+        }
+        if (typeof options.metadataProviderName === "string" && options.metadataProviderName.length > 0) {
+            const checkMetaPos = checkBuffer.__indirect(checkAqPos + checkBuffer.__offset(checkAqPos, 4));
+            const checkMetaProviderOffset = checkBuffer.__offset(checkMetaPos, 16);
+            if (!checkMetaProviderOffset || checkBuffer.__string(checkMetaPos + checkMetaProviderOffset) !== options.metadataProviderName) {
+                return { body: null, log: "WK3 aqOverlay: skipped (self-check metadata providerName mismatch)" };
+            }
+        }
         if (rebuildPollutants) {
             const checkVecPos = checkBuffer.__indirect(checkAqPos + checkBuffer.__offset(checkAqPos, 12));
             if (checkBuffer.readInt32(checkVecPos) !== rebuildPollutants.want.length) {
                 return { body: null, log: "WK3 aqOverlay: skipped (self-check pollutants vector length mismatch)" };
+            }
+            // 无符号前向检查：元素偏移必须为小正数且界内，否则苹果原生
+            // 解析越界（JS 有符号读回会掩盖此问题，beta10 即因此漏网）。
+            for (let i = 0; i < rebuildPollutants.want.length; i++) {
+                const rawOffset = checkBuffer.readUint32(checkVecPos + 4 + i * 4);
+                if (rawOffset <= 0 || rawOffset >= out.length) {
+                    return { body: null, log: "WK3 aqOverlay: skipped (self-check pollutants element offset not forward)" };
+                }
             }
             for (let i = 0; i < rebuildPollutants.want.length; i++) {
                 const elem = checkBuffer.__indirect(checkVecPos + 4 + i * 4);
