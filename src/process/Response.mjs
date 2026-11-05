@@ -1256,6 +1256,33 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
             if (metaProviderOffset) collProviderName = ByteBuffer.__string(metaPos + metaProviderOffset) || "";
         }
         const isNationalWarningCenter = ["国家预警信息发布中心", "國家預警信息發布中心", "National Early Warning Center"].includes(collProviderName);
+        // Apple 集合元数据解码（11 字段，与 WK2 Metadata 同序）：
+        // f0 attributionUrl, f1 expireTime, f2 language, f3 latitude,
+        // f4 longitude, f5 providerLogo, f6 providerName, f7 readTime,
+        // f8 reportedTime, f9 temporarilyUnavailable, f10 sourceType。
+        // 缺席字段记 null，供后续与 provider 合并时做 diff。
+        const appleMeta = { attributionUrl: null, expireTime: null, language: null, latitude: null, longitude: null, providerLogo: null, providerName: null, readTime: null, reportedTime: null, temporarilyUnavailable: null, sourceType: null };
+        let appleDetailsUrl = null;
+        if (collMetaOffset) {
+            const metaPos = ByteBuffer.__indirect(collPos + collMetaOffset);
+            const mOff = f => ByteBuffer.__offset(metaPos, 4 + f * 2);
+            const mStr = f => mOff(f) ? ByteBuffer.__string(metaPos + mOff(f)) : null;
+            const mI32 = f => mOff(f) ? ByteBuffer.readInt32(metaPos + mOff(f)) : null;
+            const mF32 = f => mOff(f) ? ByteBuffer.readFloat32(metaPos + mOff(f)) : null;
+            const mI8 = f => mOff(f) ? ByteBuffer.readInt8(metaPos + mOff(f)) : null;
+            appleMeta.attributionUrl = mStr(0);
+            appleMeta.expireTime = mI32(1);
+            appleMeta.language = mStr(2);
+            appleMeta.latitude = mF32(3);
+            appleMeta.longitude = mF32(4);
+            appleMeta.providerLogo = mStr(5);
+            appleMeta.providerName = mStr(6);
+            appleMeta.readTime = mI32(7);
+            appleMeta.reportedTime = mI32(8);
+            appleMeta.temporarilyUnavailable = mI8(9);
+            appleMeta.sourceType = mI8(10);
+        }
+        if (collDetailsOffset) appleDetailsUrl = ByteBuffer.__string(collPos + collDetailsOffset) || null;
         let providerResult;
         if (providerName === "QWeatherWeb") {
             const detailsUrl = collDetailsOffset ? ByteBuffer.__string(collPos + collDetailsOffset) : "";
@@ -1278,7 +1305,39 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
             return { body: null, log: `WK3 alerts: skipped (provider ${providerName} not wired in WK3)` };
         }
         const providerAlerts = providerResult?.alerts || [];
-        if (!providerAlerts.length) return { body: null, log: "WK3 alerts: skipped (no provider alerts)" };
+        // 元数据合并（v2 InjectWeatherAlerts 同款，beta5 补齐）：
+        // provider metadata 按字段覆盖 Apple（实测三路 provider
+        // 都只带 attributionUrl）；detailsUrl 用 provider 的
+        // （无则留 Apple）；providerLogo 缺席时按合并后
+        // providerName 补（NWC 名不在 logo 表里，实测恒为空，
+        // 但仍按 v2 原样走一遍）。v2 只以 metadata 存在为门——
+        // provider 0 条预警时元素不补，但元数据/detailsUrl 照合
+        // （和风 403 的失败体也会走到这里）；故原先的
+        // "skipped (no provider alerts)" 早退改为由下方的
+        // no-changes 门统一处理。
+        const providerMeta = providerResult?.metadata || null;
+        if (!providerMeta) return { body: null, log: "WK3 alerts: skipped (no provider metadata)" };
+        const META_STR_KEYS = ["attributionUrl", "language", "providerLogo", "providerName"];
+        const META_NUM_KEYS = ["expireTime", "readTime", "reportedTime", "sourceType"];
+        const META_F32_KEYS = ["latitude", "longitude"];
+        const mergedMeta = { ...appleMeta };
+        for (const k of META_STR_KEYS) if (typeof providerMeta[k] === "string" && providerMeta[k]) mergedMeta[k] = providerMeta[k];
+        for (const k of META_NUM_KEYS) if (typeof providerMeta[k] === "number" && Number.isFinite(providerMeta[k])) mergedMeta[k] = providerMeta[k] | 0;
+        for (const k of META_F32_KEYS) if (typeof providerMeta[k] === "number" && Number.isFinite(providerMeta[k])) mergedMeta[k] = providerMeta[k];
+        if (typeof providerMeta.temporarilyUnavailable === "boolean") mergedMeta.temporarilyUnavailable = providerMeta.temporarilyUnavailable ? 1 : 0;
+        else if (typeof providerMeta.temporarilyUnavailable === "number") mergedMeta.temporarilyUnavailable = providerMeta.temporarilyUnavailable ? 1 : 0;
+        if (!mergedMeta.providerLogo) mergedMeta.providerLogo = providerNameToLogo(mergedMeta.providerName) || null;
+        const mergedDetailsUrl = typeof providerResult?.detailsUrl === "string" && providerResult.detailsUrl ? providerResult.detailsUrl : appleDetailsUrl;
+        const metaChangedKeys = [];
+        for (const k of [...META_STR_KEYS, ...META_NUM_KEYS, "temporarilyUnavailable", ...META_F32_KEYS]) {
+            const a = appleMeta[k], b = mergedMeta[k];
+            const eq = META_F32_KEYS.includes(k) ? (a === b || (a != null && b != null && Math.fround(a) === Math.fround(b))) : (a ?? null) === (b ?? null);
+            if (!eq) metaChangedKeys.push(k);
+        }
+        // 无槽位可挂新表时元数据/detailsUrl 合并不落盘（实测体
+        // 均有这两个字段，此分支只作防御）。
+        const metaChanged = metaChangedKeys.length > 0 && !!collMetaOffset;
+        const detailsChanged = (appleDetailsUrl ?? null) !== (mergedDetailsUrl ?? null) && !!collDetailsOffset;
         // 枚举表（与 3.2 bundle 生成对象一致；解码 int→串，编码串→int）。
         const SEVERITY = ["UNKNOWN", "EXTREME", "SEVERE", "MODERATE", "MINOR", "UNKNOWN5"];
         const SIGNIFICANCE = ["UNKNOWN", "UNKNOWN1", "UNKNOWN2", "UNKNOWN3", "UNKNOWN4", "UNKNOWN5", "UNKNOWN6", "UNKNOWN7", "UNKNOWN8", "UNKNOWN9", "STATEMENT", "WARNING", "ADVISORY", "UNKNOWN13"];
@@ -1367,7 +1426,7 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
             if (ch.strings.size || ch.times.size || ch.enums.size || ch.responses) anyChange = true;
             changes.push(ch);
         }
-        if (!anyChange) return { body: null, log: `WK3 alerts: no changes (${alertCount} alerts, ${providerAlerts.length} provider alerts)` };
+        if (!anyChange && !metaChanged && !detailsChanged) return { body: null, log: `WK3 alerts: no changes (${alertCount} alerts, ${providerAlerts.length} provider alerts)` };
         // 布局：[根 uoffset][根 vtable][根表][集合 vtable][集合表][预警向量]
         // [变化元素的 vtable+表][新串][新 responses 向量][blob]。
         // 向量在表之前（beta10 教训），所有新对象都在 blob 之前，
@@ -1447,6 +1506,52 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
             respPos.set(i, cursor);
             cursor += plan.newRespSize;
         }
+        // 元数据表字段（与 WK2 Metadata 同序；kind 决定槽位大小）。
+        const META_FIELDS = [
+            ["attributionUrl", "str"], ["expireTime", "i32"], ["language", "str"], ["latitude", "f32"], ["longitude", "f32"],
+            ["providerLogo", "str"], ["providerName", "str"], ["readTime", "i32"], ["reportedTime", "i32"],
+            ["temporarilyUnavailable", "i8"], ["sourceType", "i8"],
+        ];
+        // 新元数据表（仅 metaChanged 时建；从 mergedMeta 现算，
+        // 不复用 Apple 原表布局）+ 新 detailsUrl 串（仅
+        // detailsChanged 时建）。均在 responses 向量之后、blob
+        // 之前，4 对齐。
+        let newMeta = null;
+        if (metaChanged) {
+            const vtablePos = align4(cursor);
+            cursor = vtablePos + 26;
+            const tablePos = align4(cursor);
+            const slots = new Map();
+            // 表首 4 字节是到 vtable 的 soffset，字段槽位从 +4 起
+            // （漏了这 4 字节会让 f0 的槽位与 soffset 重叠，整张
+            // 元数据表损坏——beta5 离线验证 Case A/B/F 即因此失败）。
+            let tCursor = tablePos + 4;
+            for (let f = 0; f < 11; f++) {
+                const [key, kind] = META_FIELDS[f];
+                const v = mergedMeta[key];
+                if (v == null) continue;
+                if (kind === "i8") { slots.set(f, tCursor - tablePos); tCursor += 1; }
+                else { tCursor = Math.ceil(tCursor / 4) * 4; slots.set(f, tCursor - tablePos); tCursor += 4; }
+            }
+            const tableSize = tCursor - tablePos;
+            cursor = tCursor;
+            const strPos = new Map();
+            cursor = align4(cursor);
+            for (let f = 0; f < 11; f++) {
+                const [key, kind] = META_FIELDS[f];
+                if (kind !== "str" || mergedMeta[key] == null) continue;
+                const bytes = enc.encode(mergedMeta[key]);
+                strPos.set(f, cursor);
+                cursor += align4(4 + bytes.length + 1);
+            }
+            newMeta = { vtablePos, tablePos, tableSize, slots, strPos };
+        }
+        let newDetailsPos = null;
+        if (detailsChanged) {
+            cursor = align4(cursor);
+            newDetailsPos = cursor;
+            cursor += align4(4 + enc.encode(mergedDetailsUrl).length + 1);
+        }
         const blobOffset = align8(cursor);
         const out = new Uint8Array(blobOffset + rawBody.length);
         const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
@@ -1472,11 +1577,13 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
         view.setInt32(newCollPos, newCollPos - newCollVtablePos, true);
         if (collMetaOffset) {
             const origTarget = collPos + collMetaOffset + ByteBuffer.readInt32(collPos + collMetaOffset);
-            setU32(newCollPos + collMetaOffset, (blobOffset + origTarget) - (newCollPos + collMetaOffset));
+            const target = newMeta ? newMeta.tablePos : blobOffset + origTarget;
+            setU32(newCollPos + collMetaOffset, target - (newCollPos + collMetaOffset));
         }
         if (collDetailsOffset) {
             const origTarget = collPos + collDetailsOffset + ByteBuffer.readInt32(collPos + collDetailsOffset);
-            setU32(newCollPos + collDetailsOffset, (blobOffset + origTarget) - (newCollPos + collDetailsOffset));
+            const target = newDetailsPos != null ? newDetailsPos : blobOffset + origTarget;
+            setU32(newCollPos + collDetailsOffset, target - (newCollPos + collDetailsOffset));
         }
         if (collAlertsOffset) setU32(newCollPos + collAlertsOffset, newVecPos - (newCollPos + collAlertsOffset));
         // 预警向量：未变元素指向 blob 原表，变化元素指向新表。
@@ -1541,6 +1648,35 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
                 ch.responses.forEach((v, j) => setI8(rPos + 4 + j, v));
             }
         }
+        // 新元数据表/串与新 detailsUrl 串。
+        if (newMeta) {
+            setU16(newMeta.vtablePos, 26);
+            setU16(newMeta.vtablePos + 2, newMeta.tableSize);
+            for (let f = 0; f < 11; f++) setU16(newMeta.vtablePos + 4 + f * 2, newMeta.slots.get(f) || 0);
+            setI32(newMeta.tablePos, newMeta.tablePos - newMeta.vtablePos);
+            for (let f = 0; f < 11; f++) {
+                const [key, kind] = META_FIELDS[f];
+                const v = mergedMeta[key];
+                if (v == null || !newMeta.slots.has(f)) continue;
+                const off = newMeta.tablePos + newMeta.slots.get(f);
+                if (kind === "str") setU32(off, newMeta.strPos.get(f) - off);
+                else if (kind === "i32") setI32(off, v);
+                else if (kind === "f32") view.setFloat32(off, v, true);
+                else if (kind === "i8") setI8(off, v);
+            }
+            for (const [f, sPos] of newMeta.strPos) {
+                const bytes = enc.encode(mergedMeta[META_FIELDS[f][0]]);
+                setU32(sPos, bytes.length);
+                out.set(bytes, sPos + 4);
+                out[sPos + 4 + bytes.length] = 0;
+            }
+        }
+        if (newDetailsPos != null) {
+            const bytes = enc.encode(mergedDetailsUrl);
+            setU32(newDetailsPos, bytes.length);
+            out.set(bytes, newDetailsPos + 4);
+            out[newDetailsPos + 4 + bytes.length] = 0;
+        }
         // blob：工作体原样。
         out.set(rawBody, blobOffset);
         // 自检：用真实 flatbuffers 回读，任一不符回退原体。
@@ -1585,6 +1721,46 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
                 }
             }
         }
+        // 集合元数据/detailsUrl 回读（beta8 盲区：此前只验元素，
+        // 元数据与 detailsUrl 的解析从未被自检覆盖）。
+        const checkMetaOff = checkBB.__offset(checkColl, 4);
+        const checkDetailsOff = checkBB.__offset(checkColl, 6);
+        if (metaChanged) {
+            if (!checkMetaOff) return { body: null, log: "WK3 alerts: skipped (self-check meta absent)" };
+            const checkMeta = checkBB.__indirect(checkColl + checkMetaOff);
+            const mOff = f => checkBB.__offset(checkMeta, 4 + f * 2);
+            for (const [f, k] of [[0, "attributionUrl"], [2, "language"], [5, "providerLogo"], [6, "providerName"]]) {
+                const want = mergedMeta[k];
+                if (want == null) continue;
+                const off = mOff(f);
+                if (!off || checkBB.__string(checkMeta + off) !== want) return { body: null, log: `WK3 alerts: skipped (self-check meta ${k})` };
+            }
+            for (const [f, k] of [[1, "expireTime"], [7, "readTime"], [8, "reportedTime"]]) {
+                const want = mergedMeta[k];
+                if (want == null) continue;
+                const off = mOff(f);
+                if (!off || checkBB.readInt32(checkMeta + off) !== want) return { body: null, log: `WK3 alerts: skipped (self-check meta ${k})` };
+            }
+            for (const [f, k] of [[3, "latitude"], [4, "longitude"]]) {
+                const want = mergedMeta[k];
+                if (want == null) continue;
+                const off = mOff(f);
+                if (!off || checkBB.readFloat32(checkMeta + off) !== Math.fround(want)) return { body: null, log: `WK3 alerts: skipped (self-check meta ${k})` };
+            }
+            for (const [f, k] of [[9, "temporarilyUnavailable"], [10, "sourceType"]]) {
+                const want = mergedMeta[k];
+                if (want == null) continue;
+                const off = mOff(f);
+                if (!off || checkBB.readInt8(checkMeta + off) !== want) return { body: null, log: `WK3 alerts: skipped (self-check meta ${k})` };
+            }
+        } else if (collMetaOffset && !checkMetaOff) {
+            return { body: null, log: "WK3 alerts: skipped (self-check meta lost)" };
+        }
+        if (detailsChanged) {
+            if (!checkDetailsOff || checkBB.__string(checkColl + checkDetailsOff) !== mergedDetailsUrl) return { body: null, log: "WK3 alerts: skipped (self-check detailsUrl)" };
+        } else if (collDetailsOffset && !checkDetailsOff) {
+            return { body: null, log: "WK3 alerts: skipped (self-check detailsUrl lost)" };
+        }
         // 其余槽位仍在场（根重定基未丢槽）。
         for (let slot = 0; slot < 15; slot++) {
             const origOff = ByteBuffer.__offset(rootPos, 4 + slot * 2);
@@ -1602,6 +1778,11 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
             if (ch.responses) parts.push(`responses=[${appleAlerts[i].responses.join(",")}]`);
             filledDesc.push(`alert${i}(${parts.join(",")})`);
         }
+        if (metaChanged) for (const k of metaChangedKeys) {
+            const v = mergedMeta[k];
+            filledDesc.push(`meta ${k}=${typeof v === "string" ? `"${v}"` : v}`);
+        }
+        if (detailsChanged) filledDesc.push(`detailsUrl="${mergedDetailsUrl}"`);
         return { body: out, log: `WK3 alerts: ${providerName} ${alertCount} alerts, ${providerAlerts.length} provider alerts, filled ${filledDesc.join("; ")} body ${rawBody.length}->${out.length}` };
     } catch (error) {
         return { body: null, log: `WK3 alerts: skipped (${error?.message ?? error})` };
