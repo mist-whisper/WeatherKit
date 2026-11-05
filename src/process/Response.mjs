@@ -2712,7 +2712,7 @@ const WK3_NH_SOURCE = { MODELED: 2, STATION: 3 };
 // （移植对照已删除：beta1/beta2 的 transplantWK3NextHourFixed 与东京十六进制常量
 // 见分支历史；beta2 判别已闭合——错在源名而非存在性，填空路线恢复。）
 
-// ---- WK3 NextHour fill (3.4.2-beta3): rebuild slot 5 per PR #108 spec, §189 fixes ----
+// ---- WK3 NextHour fill (3.4.2-beta4): rebuild slot 5 per PR #108 spec, §189 fixes + §207 vtable trim ----
 // §189 fixes vs beta8: ① attributionUrl truncation (cursor = metaPos + 44, not
 // cursor += 44 after align8) + attributionUrl in the self-check; ② uniform-window
 // token CLEAR=1 -> CONSTANT=6 (no real WK3 table ever showed token 1; Tokyo's
@@ -2864,7 +2864,12 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             d = Math.ceil(d / 4) * 4;
             const size = d + 4;
             const offsets = fields.map((f, i) => (f.present ? size - endDist[i] : 0));
-            return { size, offsets };
+            // §207 (beta4): Builder endObject() trims trailing zero vtable entries:
+            // vlen covers only up to the last present field.
+            let lastPresent = -1;
+            for (let i = 0; i < fields.length; i++) if (fields[i].present) lastPresent = i;
+            const vlen = 4 + 2 * (lastPresent + 1);
+            return { size, offsets, vlen, lastPresent };
         };
         // Per-table layouts, computed before the cursor walk (sizes vary with
         // which fields are default-0 and omitted).
@@ -2915,7 +2920,7 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const condTables = [];
         for (let i = 0; i < conditions.length; i++) {
             const c = conditions[i];
-            const vt = align4(cursor); cursor = vt + 16;
+            const vt = align4(cursor); cursor = vt + condLayouts[i].vlen;
             const tp = align4(cursor); cursor = tp + condLayouts[i].size;
             const pv = align4(cursor); cursor = pv + 4 + 4 * c.params.length;
             const ptables = [];
@@ -2929,7 +2934,7 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const summVecPos = align4(cursor); cursor = summVecPos + 4 + 4 * summaries.length;
         const summTables = [];
         for (let j = 0; j < summaries.length; j++) {
-            const vt = align4(cursor); cursor = vt + 14;
+            const vt = align4(cursor); cursor = vt + summLayouts[j].vlen;
             const tp = align4(cursor); cursor = tp + summLayouts[j].size;
             const cv = align4(cursor); cursor = cv + 8; // byte vector: [u32 len=1][value][zero pad]
             summTables.push({ vtable: vt, table: tp, condVec: cv, layout: summLayouts[j] });
@@ -2937,7 +2942,7 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const minVecPos = align4(cursor); cursor = minVecPos + 4 + 4 * minutes.length;
         const minTables = [];
         for (let j = 0; j < minutes.length; j++) {
-            const vt = align4(cursor); cursor = vt + 12;
+            const vt = align4(cursor); cursor = vt + minLayouts[j].vlen;
             const tp = align4(cursor); cursor = tp + minLayouts[j].size;
             minTables.push({ vtable: vt, table: tp, layout: minLayouts[j] });
         }
@@ -3000,8 +3005,8 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             const t = condTables[i];
             const L = t.layout;
             setU32(condVecPos + 4 + i * 4, t.table - (condVecPos + 4 + i * 4));
-            setU16(t.vtable, 16); setU16(t.vtable + 2, L.size);
-            for (let f = 0; f < 6; f++) setU16(t.vtable + 4 + f * 2, L.offsets[f]);
+            setU16(t.vtable, L.vlen); setU16(t.vtable + 2, L.size);
+            for (let f = 0; f <= L.lastPresent; f++) setU16(t.vtable + 4 + f * 2, L.offsets[f]);
             setI32(t.table, t.table - t.vtable);
             setU32(t.table + L.offsets[5], t.paramsVec - (t.table + L.offsets[5]));
             setI8(t.table + L.offsets[4], c.end);
@@ -3026,8 +3031,8 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             const t = summTables[i];
             const L = t.layout;
             setU32(summVecPos + 4 + i * 4, t.table - (summVecPos + 4 + i * 4));
-            setU16(t.vtable, 14); setU16(t.vtable + 2, L.size);
-            for (let f = 0; f < 5; f++) setU16(t.vtable + 4 + f * 2, L.offsets[f]);
+            setU16(t.vtable, L.vlen); setU16(t.vtable + 2, L.size);
+            for (let f = 0; f <= L.lastPresent; f++) setU16(t.vtable + 4 + f * 2, L.offsets[f]);
             setI32(t.table, t.table - t.vtable);
             if (L.offsets[4]) setF32(t.table + L.offsets[4], s.precipitationIntensity);
             if (L.offsets[3]) setI8(t.table + L.offsets[3], s.precipitationChance);
@@ -3046,8 +3051,8 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             const t = minTables[i];
             const L = t.layout;
             setU32(minVecPos + 4 + i * 4, t.table - (minVecPos + 4 + i * 4));
-            setU16(t.vtable, 12); setU16(t.vtable + 2, L.size);
-            for (let f = 0; f < 4; f++) setU16(t.vtable + 4 + f * 2, L.offsets[f]);
+            setU16(t.vtable, L.vlen); setU16(t.vtable + 2, L.size);
+            for (let f = 0; f <= L.lastPresent; f++) setU16(t.vtable + 4 + f * 2, L.offsets[f]);
             setI32(t.table, t.table - t.vtable);
             if (L.offsets[3]) setF32(t.table + L.offsets[3], m.perceivedPrecipitationIntensity);
             if (L.offsets[2]) setF32(t.table + L.offsets[2], m.precipitationIntensity);
@@ -3163,7 +3168,7 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         }
         return {
             body: out,
-            log: `WK3 nhFill: slot 5 created (beta3 §189 fixes${opts.shiftToNow ? " shiftToNow" : ""}) minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
+            log: `WK3 nhFill: slot 5 created (beta4 §207 vtable trim${opts.shiftToNow ? " shiftToNow" : ""}) minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
         };
     } catch (e) {
         return { body: null, log: `WK3 nhFill: skipped (exception ${e?.message ?? e})` };
