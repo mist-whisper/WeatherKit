@@ -136,25 +136,26 @@ export async function Response($request, $response) {
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
                                 const cwReplace = replaceWK3CWTemperature(workingByteBuffer, workingBody, parameters.country, Settings?.Weather?.Provider, providerCurrentWeather);
-                                if (cwReplace.body) workingBody = cwReplace.body;
-                                // 未来一小时填空（WK3）：仅槽 5 缺失且数据集选中时，
-                                // 按 Settings.NextHour.Provider 拉 provider 分钟数据新建槽 5；
-                                // Apple 给了就不动；拉不到或自检失败一律原样返回。
-                                const nhDefaultLog = "WK3 nh: skipped (slot 5 present or NextHour off)";
-                                let nhReplace = { body: null, log: nhDefaultLog };
-                                {
-                                    const workingRootPos = workingByteBuffer.readInt32(workingByteBuffer.position()) + workingByteBuffer.position();
-                                    const slot5Absent = !workingByteBuffer.__offset(workingRootPos, 4 + 5 * 2);
-                                    const nhDataSetsOn = (Settings?.DataSets || []).includes("forecastNextHour");
-                                    if (slot5Absent && nhDataSetsOn) {
-                                        // BISECT beta6: Tokyo-original NH transplant (no provider fetch; fill not used this beta)
-                                        nhReplace = transplantWK3NextHour(workingByteBuffer, workingBody);
-                                        if (nhReplace.body) {
-                                            workingBody = nhReplace.body;
-                                            workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
-                                        }
-                                    }
+                                if (cwReplace.body) {
+                                    workingBody = cwReplace.body;
+                                    workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
+                                // 预警补充（WK3 beta7）：只改现有槽 9 的预警元素，
+                                // 不新建元素、不动元数据/detailsUrl；provider 默认
+                                // QWeatherWeb（和风详情页）；失败一律原样返回。
+                                const alertsReplace = await supplementWK3Alerts(workingByteBuffer, workingBody, parameters, Settings);
+                                if (alertsReplace.body) {
+                                    workingBody = alertsReplace.body;
+                                    workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
+                                }
+                                // 未来一小时填空（WK3）：beta6 已证实，任何新建槽 5
+                                // 的体（填空/最小/窗口-only/东京原表移植）都会被 App
+                                // 整包丢弃（槽位存在本身即缺陷），故 beta7 起停用
+                                // 移植，槽 5 保持原样缺席，以免遮住预警补充的结果。
+                                // transplantWK3NextHour 与 fillWK3NextHour 保留在文件
+                                // 里备查，本 beta 不调用。
+                                const nhDefaultLog = "WK3 nh: skipped (transplant parked, slot-presence defect)";
+                                let nhReplace = { body: null, log: nhDefaultLog };
                                 rawBody = workingBody;
                                 Console.warn(
                                     "WK3 weather response (experiment, not a fix) [cwReplace: CW real provider temperature, all other bytes unchanged, fail -> original]",
@@ -168,6 +169,7 @@ export async function Response($request, $response) {
                                     ...slotLines,
                                     aqReplace.log,
                                     cwReplace.log,
+                                    alertsReplace.log,
                                     nhReplace.log,
                                 );
                                 break;
@@ -880,6 +882,377 @@ function replaceWK3CWTemperature(ByteBuffer, rawBody, country, providerName, pro
         return { body: modified, log: `WK3 cwReplace: provider ${providerName} temp ${oldTemp.toFixed(2)}->${newTemp.toFixed(2)} apparent ${oldApparent.toFixed(2)}->${newApparent.toFixed(2)} dew ${oldDew.toFixed(2)}->${newDew.toFixed(2)} (${dewSource}) humidity ${humidity}` };
     } catch (error) {
         return { body: null, log: `WK3 cwReplace: skipped (${error?.message ?? error})` };
+    }
+}
+
+/**
+ * WK3 预警补充（beta7）：只改现有槽 9 的预警元素，不新建元素，
+ * 不动集合元数据 / detailsUrl / logo。provider 本 beta 只接
+ * QWeatherWeb（默认路径，和风详情页）；其余 provider 未接线，
+ * 一律回退原体。流程：解码槽 9 元素为 v2 形状 → 调现有
+ * WeatherAlerts.mergeAlerts（评分匹配 + 只补缺失/占位字段）
+ * → 只把变化的字段写回（元素表重建 + 向量重建 + 集合表重建
+ * + 根重定基，复用 AQ 覆盖架构），任一校验失败回退原体。
+ * WK3 元素 22 字段 = WK2 前 22 字段、顺序不变（哈尔滨实测），
+ * WK2 的 unknown23～26 已删；元素内向量必须在表之前（beta10
+ * 教训），本函数布局保证这一点。
+ * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
+ * @param {Uint8Array} rawBody - 工作体（已含 AQ/CW 覆盖）
+ * @param {object} parameters - parseWeatherKitURL 的结果（含经纬度、语言）
+ * @param {object} Settings - 插件设置
+ * @returns {Promise<{body: Uint8Array|null, log: string}>}
+ */
+async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
+    try {
+        const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
+        const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
+        const rootVtableLen = ByteBuffer.readUint16(rootVtablePos);
+        const rootTableSize = ByteBuffer.readUint16(rootVtablePos + 2);
+        const rootFieldCount = Math.floor((rootVtableLen - 4) / 2);
+        if (rootFieldCount !== 15 || rootTableSize <= 0 || rootTableSize > 1024) {
+            return { body: null, log: `WK3 alerts: skipped (unexpected root fields=${rootFieldCount} size=${rootTableSize})` };
+        }
+        const slot9Offset = ByteBuffer.__offset(rootPos, 4 + 9 * 2);
+        if (!slot9Offset) return { body: null, log: "WK3 alerts: skipped (slot 9 absent)" };
+        const collPos = ByteBuffer.__indirect(rootPos + slot9Offset);
+        const collVtablePos = collPos - ByteBuffer.readInt32(collPos);
+        const collVtableLen = ByteBuffer.readUint16(collVtablePos);
+        const collTableSize = ByteBuffer.readUint16(collVtablePos + 2);
+        const collFieldCount = Math.floor((collVtableLen - 4) / 2);
+        if (collFieldCount !== 3 || collTableSize <= 0 || collTableSize > 256) {
+            return { body: null, log: `WK3 alerts: skipped (unexpected alerts collection fields=${collFieldCount} size=${collTableSize})` };
+        }
+        const collMetaOffset = ByteBuffer.__offset(collPos, 4);
+        const collDetailsOffset = ByteBuffer.__offset(collPos, 6);
+        const collAlertsOffset = ByteBuffer.__offset(collPos, 8);
+        if (!collAlertsOffset) return { body: null, log: "WK3 alerts: skipped (alerts vector absent)" };
+        const vecPos = ByteBuffer.__indirect(collPos + collAlertsOffset);
+        const alertCount = ByteBuffer.readInt32(vecPos);
+        if (alertCount <= 0 || alertCount > 64) return { body: null, log: `WK3 alerts: skipped (alert count ${alertCount})` };
+        // provider：本 beta 只接 QWeatherWeb（默认路径）。
+        const providerName = Settings?.WeatherAlerts?.Provider || "QWeatherWeb";
+        if (providerName === "WeatherKit") return { body: null, log: "WK3 alerts: skipped (provider WeatherKit)" };
+        if (providerName !== "QWeatherWeb") return { body: null, log: `WK3 alerts: skipped (provider ${providerName} not wired in WK3)` };
+        const detailsUrl = collDetailsOffset ? ByteBuffer.__string(collPos + collDetailsOffset) : "";
+        if (!detailsUrl) return { body: null, log: "WK3 alerts: skipped (no detailsUrl)" };
+        const qWeather = new QWeather({ ...parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host);
+        const providerResult = await qWeather.WeatherAlertWeb(detailsUrl);
+        const providerAlerts = providerResult?.alerts || [];
+        if (!providerAlerts.length) return { body: null, log: "WK3 alerts: skipped (no provider alerts)" };
+        // 枚举表（与 3.2 bundle 生成对象一致；解码 int→串，编码串→int）。
+        const SEVERITY = ["UNKNOWN", "EXTREME", "SEVERE", "MODERATE", "MINOR", "UNKNOWN5"];
+        const SIGNIFICANCE = ["UNKNOWN", "UNKNOWN1", "UNKNOWN2", "UNKNOWN3", "UNKNOWN4", "UNKNOWN5", "UNKNOWN6", "UNKNOWN7", "UNKNOWN8", "UNKNOWN9", "STATEMENT", "WARNING", "ADVISORY", "UNKNOWN13"];
+        const URGENCY = ["UNKNOWN", "IMMEDIATE", "EXPECTED", "FUTURE", "PAST", "UNKNOWN5"];
+        const CERTAINTY = ["UNKNOWN", "OBSERVED", "LIKELY", "POSSIBLE", "UNLIKELY", "UNKNOWN5"];
+        const IMPORTANCE = ["NORMAL", "LOW", "HIGH", "UNKNOWN3", "UNKNOWN4", "UNKNOWN5"];
+        const RESPONSE = ["UNKNOWN0", "SHELTER", "EVACUATE", "PREPARE", "EXECUTE", "AVOID", "MONITOR", "ACCESS", "ALLCLEAR", "NONE", "UNKNOWN10"];
+        const enumStr = (table, v) => table[v] ?? "UNKNOWN";
+        const appleAlerts = [];
+        const elemInfos = [];
+        for (let i = 0; i < alertCount; i++) {
+            const slotPos = vecPos + 4 + i * 4;
+            const elemPos = ByteBuffer.__indirect(slotPos);
+            const elemVtablePos = elemPos - ByteBuffer.readInt32(elemPos);
+            const elemVtableLen = ByteBuffer.readUint16(elemVtablePos);
+            const elemTableSize = ByteBuffer.readUint16(elemVtablePos + 2);
+            const elemFieldCount = Math.floor((elemVtableLen - 4) / 2);
+            if (elemFieldCount !== 22 || elemTableSize <= 0 || elemTableSize > 256) {
+                return { body: null, log: `WK3 alerts: skipped (unexpected alert element fields=${elemFieldCount} size=${elemTableSize})` };
+            }
+            const foffs = [];
+            for (let f = 0; f < 22; f++) foffs.push(ByteBuffer.__offset(elemPos, 4 + f * 2));
+            const strF = f => foffs[f] ? ByteBuffer.__string(elemPos + foffs[f]) : null;
+            const intF = (f, read) => foffs[f] ? read(elemPos + foffs[f]) : 0;
+            let responses = [];
+            if (foffs[21]) {
+                const rvecPos = ByteBuffer.__indirect(elemPos + foffs[21]);
+                const rlen = ByteBuffer.readInt32(rvecPos);
+                if (rlen < 0 || rlen > 32) return { body: null, log: `WK3 alerts: skipped (responses length ${rlen})` };
+                for (let j = 0; j < rlen; j++) responses.push(enumStr(RESPONSE, ByteBuffer.readInt8(rvecPos + 4 + j)));
+            }
+            appleAlerts.push({
+                id: null,
+                areaId: strF(1),
+                areaName: strF(2),
+                attributionUrl: strF(3),
+                certainty: enumStr(CERTAINTY, intF(19, p => ByteBuffer.readInt8(p))),
+                countryCode: strF(4),
+                description: strF(5),
+                detailsUrl: strF(12),
+                effectiveTime: intF(7, p => ByteBuffer.readInt32(p)),
+                eventEndTime: intF(11, p => ByteBuffer.readInt32(p)),
+                eventOnsetTime: intF(10, p => ByteBuffer.readInt32(p)),
+                eventSource: strF(17),
+                expireTime: intF(8, p => ByteBuffer.readInt32(p)),
+                importance: enumStr(IMPORTANCE, intF(20, p => ByteBuffer.readInt8(p))),
+                issuedTime: intF(9, p => ByteBuffer.readInt32(p)),
+                phenomenon: strF(13),
+                responses,
+                severity: enumStr(SEVERITY, intF(14, p => ByteBuffer.readInt8(p))),
+                significance: enumStr(SIGNIFICANCE, intF(15, p => ByteBuffer.readInt8(p))),
+                source: strF(16),
+                token: strF(6),
+                urgency: enumStr(URGENCY, intF(18, p => ByteBuffer.readInt8(p))),
+            });
+            elemInfos.push({ elemPos, elemVtablePos, elemVtableLen, elemTableSize, foffs });
+        }
+        // 合并（v2 逻辑：评分匹配 + 只补缺失/占位字段；不新建元素）。
+        const before = appleAlerts.map(a => ({ ...a, responses: [...a.responses] }));
+        WeatherAlerts.mergeAlerts(appleAlerts, providerAlerts);
+        const STRING_FIELDS = [[1, "areaId"], [2, "areaName"], [3, "attributionUrl"], [4, "countryCode"], [5, "description"], [6, "token"], [12, "detailsUrl"], [13, "phenomenon"], [16, "source"], [17, "eventSource"]];
+        const TIME_FIELDS = [[7, "effectiveTime"], [8, "expireTime"], [9, "issuedTime"], [10, "eventOnsetTime"], [11, "eventEndTime"]];
+        const ENUM_FIELDS = [[14, "severity", SEVERITY], [15, "significance", SIGNIFICANCE], [18, "urgency", URGENCY], [19, "certainty", CERTAINTY], [20, "importance", IMPORTANCE]];
+        const changes = [];
+        let anyChange = false;
+        for (let i = 0; i < alertCount; i++) {
+            const ch = { strings: new Map(), times: new Map(), enums: new Map(), responses: null };
+            const b = before[i], a = appleAlerts[i];
+            for (const [f, key] of STRING_FIELDS) {
+                if ((b[key] ?? null) !== (a[key] ?? null) && a[key] != null) ch.strings.set(f, a[key]);
+            }
+            for (const [f, key] of TIME_FIELDS) {
+                if ((b[key] || 0) !== (a[key] || 0) && (a[key] || 0) !== 0) ch.times.set(f, a[key]);
+            }
+            for (const [f, key, table] of ENUM_FIELDS) {
+                if (b[key] !== a[key]) {
+                    const idx = table.indexOf(a[key]);
+                    if (idx >= 0) ch.enums.set(f, idx);
+                }
+            }
+            if (JSON.stringify(b.responses) !== JSON.stringify(a.responses) && a.responses.length) {
+                const ints = [];
+                for (const r of a.responses) { const idx = RESPONSE.indexOf(r); if (idx >= 0) ints.push(idx); }
+                if (ints.length) ch.responses = ints;
+            }
+            if (ch.strings.size || ch.times.size || ch.enums.size || ch.responses) anyChange = true;
+            changes.push(ch);
+        }
+        if (!anyChange) return { body: null, log: `WK3 alerts: no changes (${alertCount} alerts, ${providerAlerts.length} provider alerts)` };
+        // 布局：[根 uoffset][根 vtable][根表][集合 vtable][集合表][预警向量]
+        // [变化元素的 vtable+表][新串][新 responses 向量][blob]。
+        // 向量在表之前（beta10 教训），所有新对象都在 blob 之前，
+        // 故一切 uoffset 均为前向。
+        const align4 = v => Math.ceil(v / 4) * 4;
+        const align8 = v => Math.ceil(v / 8) * 8;
+        const enc = new TextEncoder();
+        // 先算每条变化元素的扩展表长与新串/向量尺寸。
+        const elemPlans = [];
+        for (let i = 0; i < alertCount; i++) {
+            const ch = changes[i];
+            const info = elemInfos[i];
+            if (!ch.strings.size && !ch.times.size && !ch.enums.size && !ch.responses) {
+                elemPlans.push(null);
+                continue;
+            }
+            // 缺席字段的追加：先 int32（4 对齐），后 int8（1 对齐）。
+            const added = new Map(); // field -> offset in new table
+            let cursor = info.elemTableSize;
+            const addedInt32 = [];
+            const addedInt8 = [];
+            for (const [f] of ch.times) if (!info.foffs[f]) addedInt32.push(f);
+            for (const [f] of ch.enums) if (!info.foffs[f]) addedInt8.push(f);
+            for (const f of addedInt32) { cursor = Math.ceil(cursor / 4) * 4; added.set(f, cursor); cursor += 4; }
+            for (const f of addedInt8) { added.set(f, cursor); cursor += 1; }
+            const newTableSize = cursor;
+            const newStrings = [];
+            for (const [f, s] of [...ch.strings.entries()].sort((a, b) => a[0] - b[0])) {
+                const bytes = enc.encode(s);
+                newStrings.push({ field: f, bytes, size: align4(4 + bytes.length + 1) });
+            }
+            const newRespSize = ch.responses ? align4(4 + ch.responses.length) : 0;
+            elemPlans.push({ added, newTableSize, newStrings, newRespSize });
+        }
+        const newRootVtablePos = 4;
+        const newRootPos = align4(newRootVtablePos + rootVtableLen);
+        const newCollVtablePos = align4(newRootPos + rootTableSize);
+        const newCollPos = newCollVtablePos + collVtableLen;
+        const newVecPos = align4(newCollPos + collTableSize);
+        const newVecSize = 4 + alertCount * 4;
+        let cursor = align4(newVecPos + newVecSize);
+        const elemNewPos = [];
+        for (let i = 0; i < alertCount; i++) {
+            const plan = elemPlans[i];
+            if (!plan) { elemNewPos.push(null); continue; }
+            const vtablePos = cursor;
+            cursor += elemInfos[i].elemVtableLen;
+            const tablePos = cursor;
+            cursor += plan.newTableSize;
+            elemNewPos.push({ vtablePos, tablePos, plan });
+        }
+        const strPos = new Map(); // "i:f" -> pos
+        for (let i = 0; i < alertCount; i++) {
+            const plan = elemPlans[i];
+            if (!plan) continue;
+            for (const s of plan.newStrings) {
+                strPos.set(`${i}:${s.field}`, cursor);
+                cursor += s.size;
+            }
+        }
+        const respPos = new Map(); // i -> pos
+        for (let i = 0; i < alertCount; i++) {
+            const plan = elemPlans[i];
+            if (!plan || !plan.newRespSize) continue;
+            respPos.set(i, cursor);
+            cursor += plan.newRespSize;
+        }
+        const blobOffset = align8(cursor);
+        const out = new Uint8Array(blobOffset + rawBody.length);
+        const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+        const setU32 = (p, v) => view.setUint32(p, v, true);
+        const setI32 = (p, v) => view.setInt32(p, v, true);
+        const setI8 = (p, v) => view.setInt8(p, v);
+        const setU16 = (p, v) => view.setUint16(p, v, true);
+        // 根 uoffset 与根 vtable/根表。
+        setU32(0, newRootPos);
+        out.set(rawBody.subarray(rootVtablePos, rootVtablePos + rootVtableLen), newRootVtablePos);
+        out.set(rawBody.subarray(rootPos, rootPos + rootTableSize), newRootPos);
+        view.setInt32(newRootPos, newRootPos - newRootVtablePos, true);
+        for (let slot = 0; slot < rootFieldCount; slot++) {
+            const fieldOff = ByteBuffer.__offset(rootPos, 4 + slot * 2);
+            if (!fieldOff) continue;
+            const origTarget = rootPos + fieldOff + ByteBuffer.readInt32(rootPos + fieldOff);
+            const newTarget = slot === 9 ? newCollPos : blobOffset + origTarget;
+            setU32(newRootPos + fieldOff, newTarget - (newRootPos + fieldOff));
+        }
+        // 集合 vtable/集合表。
+        out.set(rawBody.subarray(collVtablePos, collVtablePos + collVtableLen), newCollVtablePos);
+        out.set(rawBody.subarray(collPos, collPos + collTableSize), newCollPos);
+        view.setInt32(newCollPos, newCollPos - newCollVtablePos, true);
+        if (collMetaOffset) {
+            const origTarget = collPos + collMetaOffset + ByteBuffer.readInt32(collPos + collMetaOffset);
+            setU32(newCollPos + collMetaOffset, (blobOffset + origTarget) - (newCollPos + collMetaOffset));
+        }
+        if (collDetailsOffset) {
+            const origTarget = collPos + collDetailsOffset + ByteBuffer.readInt32(collPos + collDetailsOffset);
+            setU32(newCollPos + collDetailsOffset, (blobOffset + origTarget) - (newCollPos + collDetailsOffset));
+        }
+        if (collAlertsOffset) setU32(newCollPos + collAlertsOffset, newVecPos - (newCollPos + collAlertsOffset));
+        // 预警向量：未变元素指向 blob 原表，变化元素指向新表。
+        setU32(newVecPos, alertCount);
+        for (let i = 0; i < alertCount; i++) {
+            const slotP = newVecPos + 4 + i * 4;
+            const target = elemNewPos[i] ? elemNewPos[i].tablePos : blobOffset + elemInfos[i].elemPos;
+            setU32(slotP, target - slotP);
+        }
+        // 变化元素的 vtable/表/新串/新向量。
+        for (let i = 0; i < alertCount; i++) {
+            const np = elemNewPos[i];
+            if (!np) continue;
+            const info = elemInfos[i];
+            const ch = changes[i];
+            const plan = np.plan;
+            out.set(rawBody.subarray(info.elemVtablePos, info.elemVtablePos + info.elemVtableLen), np.vtablePos);
+            out.set(rawBody.subarray(info.elemPos, info.elemPos + info.elemTableSize), np.tablePos);
+            view.setInt32(np.tablePos, np.tablePos - np.vtablePos, true);
+            setU16(np.vtablePos + 2, plan.newTableSize);
+            // 追加的缺席字段：vtable 入口指向扩展区。
+            for (const [f, off] of plan.added) setU16(np.vtablePos + 4 + f * 2, off);
+            // 标量：原位改写（已存在字段）或写入扩展区（新增字段）。
+            for (const [f, v] of ch.times) {
+                const off = info.foffs[f] || plan.added.get(f);
+                setI32(np.tablePos + off, v);
+            }
+            for (const [f, v] of ch.enums) {
+                const off = info.foffs[f] || plan.added.get(f);
+                setI8(np.tablePos + off, v);
+            }
+            // 偏移字段：新串 / 新向量 / blob 原对象，一律重算。
+            const OFFSET_FIELDS = [0, 1, 2, 3, 4, 5, 6, 12, 13, 16, 17, 21];
+            for (const f of OFFSET_FIELDS) {
+                const fieldOff = info.foffs[f];
+                if (!fieldOff && !ch.strings.has(f) && f !== 21) continue;
+                if (ch.strings.has(f)) {
+                    // 新串字段若原先缺席则跳过（beta7 只改已存在的串字段，
+                    // 如 description；缺席串字段的表扩展留给后续 beta）。
+                    if (!fieldOff) continue;
+                    const sPos = strPos.get(`${i}:${f}`);
+                    setU32(np.tablePos + fieldOff, sPos - (np.tablePos + fieldOff));
+                } else if (f === 21 && ch.responses) {
+                    const rPos = respPos.get(i);
+                    setU32(np.tablePos + fieldOff, rPos - (np.tablePos + fieldOff));
+                } else if (fieldOff) {
+                    const origTarget = info.elemPos + fieldOff + ByteBuffer.readInt32(info.elemPos + fieldOff);
+                    setU32(np.tablePos + fieldOff, (blobOffset + origTarget) - (np.tablePos + fieldOff));
+                }
+            }
+            // 新串对象：长度 + 字节 + NUL，4 对齐。
+            for (const s of plan.newStrings) {
+                const sPos = strPos.get(`${i}:${s.field}`);
+                setU32(sPos, s.bytes.length);
+                out.set(s.bytes, sPos + 4);
+                out[sPos + 4 + s.bytes.length] = 0;
+            }
+            // 新 responses 向量：长度 + int8 枚举。
+            if (ch.responses) {
+                const rPos = respPos.get(i);
+                setU32(rPos, ch.responses.length);
+                ch.responses.forEach((v, j) => setI8(rPos + 4 + j, v));
+            }
+        }
+        // blob：工作体原样。
+        out.set(rawBody, blobOffset);
+        // 自检：用真实 flatbuffers 回读，任一不符回退原体。
+        const checkBB = new flatbuffers.ByteBuffer(out);
+        const checkRoot = checkBB.readInt32(checkBB.position()) + checkBB.position();
+        if (Math.floor((checkBB.readUint16(checkRoot - checkBB.readInt32(checkRoot)) - 4) / 2) !== 15) {
+            return { body: null, log: "WK3 alerts: skipped (self-check root fields)" };
+        }
+        const checkSlot9 = checkBB.__offset(checkRoot, 4 + 9 * 2);
+        if (!checkSlot9) return { body: null, log: "WK3 alerts: skipped (self-check slot 9)" };
+        const checkColl = checkBB.__indirect(checkRoot + checkSlot9);
+        const checkAlertsOff = checkBB.__offset(checkColl, 8);
+        if (!checkAlertsOff) return { body: null, log: "WK3 alerts: skipped (self-check alerts vector)" };
+        const checkVec = checkBB.__indirect(checkColl + checkAlertsOff);
+        if (checkBB.readInt32(checkVec) !== alertCount) return { body: null, log: "WK3 alerts: skipped (self-check vector length)" };
+        for (let i = 0; i < alertCount; i++) {
+            const slotP = checkVec + 4 + i * 4;
+            const elemU = checkBB.readUint32(slotP);
+            if (elemU <= 0 || slotP + elemU >= out.length) return { body: null, log: "WK3 alerts: skipped (self-check element offset)" };
+            const elemP = slotP + elemU;
+            const ch = changes[i];
+            const fo = f => checkBB.__offset(elemP, 4 + f * 2);
+            for (const [f, s] of ch.strings) {
+                const off = fo(f);
+                if (!off || checkBB.__string(elemP + off) !== s) return { body: null, log: `WK3 alerts: skipped (self-check alert ${i} string field ${f})` };
+            }
+            for (const [f, v] of ch.times) {
+                const off = fo(f);
+                if (!off || checkBB.readInt32(elemP + off) !== v) return { body: null, log: `WK3 alerts: skipped (self-check alert ${i} time field ${f})` };
+            }
+            for (const [f, v] of ch.enums) {
+                const off = fo(f);
+                if (!off || checkBB.readInt8(elemP + off) !== v) return { body: null, log: `WK3 alerts: skipped (self-check alert ${i} enum field ${f})` };
+            }
+            if (ch.responses) {
+                const off = fo(21);
+                if (!off) return { body: null, log: `WK3 alerts: skipped (self-check alert ${i} responses absent)` };
+                const rvec = checkBB.__indirect(elemP + off);
+                if (checkBB.readInt32(rvec) !== ch.responses.length) return { body: null, log: `WK3 alerts: skipped (self-check alert ${i} responses length)` };
+                for (let j = 0; j < ch.responses.length; j++) {
+                    if (checkBB.readInt8(rvec + 4 + j) !== ch.responses[j]) return { body: null, log: `WK3 alerts: skipped (self-check alert ${i} responses[${j}])` };
+                }
+            }
+        }
+        // 其余槽位仍在场（根重定基未丢槽）。
+        for (let slot = 0; slot < 15; slot++) {
+            const origOff = ByteBuffer.__offset(rootPos, 4 + slot * 2);
+            const newOff = checkBB.__offset(checkRoot, 4 + slot * 2);
+            if (!!origOff !== !!newOff) return { body: null, log: `WK3 alerts: skipped (self-check slot ${slot} presence)` };
+        }
+        const filledDesc = [];
+        for (let i = 0; i < alertCount; i++) {
+            const ch = changes[i];
+            if (!ch.strings.size && !ch.times.size && !ch.enums.size && !ch.responses) continue;
+            const parts = [];
+            if (ch.strings.has(5)) parts.push(`description="${appleAlerts[i].description}"`);
+            if (ch.times.has(10)) parts.push(`onset=${appleAlerts[i].eventOnsetTime}`);
+            if (ch.times.has(11)) parts.push(`end=${appleAlerts[i].eventEndTime}`);
+            if (ch.responses) parts.push(`responses=[${appleAlerts[i].responses.join(",")}]`);
+            filledDesc.push(`alert${i}(${parts.join(",")})`);
+        }
+        return { body: out, log: `WK3 alerts: QWeatherWeb ${alertCount} alerts, ${providerAlerts.length} provider alerts, filled ${filledDesc.join("; ")} body ${rawBody.length}->${out.length}` };
+    } catch (error) {
+        return { body: null, log: `WK3 alerts: skipped (${error?.message ?? error})` };
     }
 }
 
