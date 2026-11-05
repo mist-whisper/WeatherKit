@@ -179,12 +179,13 @@ export async function Response($request, $response) {
                                     workingBody = hourlyReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
-                                // 未来一小时移植对照（WK3 3.4.2-beta1）：把真实 Apple 东京槽 5
+                                // 未来一小时移植对照·源名本地变体（WK3 3.4.2-beta2）：把真实 Apple 东京槽 5
                                 // 原样拼进本城市的体，判别槽 5 存在性本身是不是 breaker（§187：
                                 // beta8 按 PR #108 规格重建的填空仍被拒收）。填空路线旁路停放，
                                 // fillWK3NextHour 留在文件里，判别后再决定恢复填空还是停放 NextHour。
                                 // 只在 forecastNextHour 在 dataSets 且国家在 Replace 时跑；
                                 // 不取 provider 数据（移植用的是东京真字节）；任一失败原样返回，
+                                // 元数据 providerName/attributionUrl 改为本地值（排除 JMA 源名干扰，§196）；
                                 // 不影响其他槽。面板若出现，显示的是东京的雨（对照本意，不是 bug）。
                                 let nhReplace = { body: null, log: "WK3 nh: skipped (not attempted)" };
                                 if (parameters.dataSets.includes("forecastNextHour") && Settings?.Weather?.Replace?.includes(parameters.country)) {
@@ -2713,7 +2714,8 @@ function utf8Bytes(str) {
     for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
     return out;
 }
-// ---- WK3 NextHour transplant control (3.4.2-beta1): splice the REAL Apple Tokyo
+// ---- WK3 NextHour transplant control, localized-source variant (3.4.2-beta2):
+// splice the REAL Apple Tokyo
 // slot 5 into a slot-5-less body, to test on-device whether slot 5's EXISTENCE is
 // the breaker (§187: the beta8 fill per PR #108 spec was still rejected).
 // The blob is the real capture bytes (Tokyo capture[896:3188], 2292 bytes) — NOT the
@@ -2724,7 +2726,9 @@ function utf8Bytes(str) {
 // the capture in beta1-342-extract.mjs).
 // FIX 1 (§183): root vtable TABLE-SIZE field bumped +4 (the old transplant forgot).
 // FIX 2 (§190): metadata vtable copy appended to the blob, soffset repointed.
-// providerName stays "Japan Meteorological Agency"; lat/lon are set to the target
+// beta2 variant (§196): providerName is localized to "彩云天气" and attributionUrl
+// to "https://www.caiyunapp.com/h5" (in-place string patch; new strings are shorter,
+// so they fit the original allocations); lat/lon are set to the target
 // city's (from the base body's slot-0 AQ metadata); times shift uniformly to now
 // (minute-floored window start, readTime = exact now — Apple's pattern).
 // Any failure returns the original body. fillWK3NextHour stays in the file, parked,
@@ -2813,6 +2817,27 @@ function transplantWK3NextHourFixed(ByteBuffer, rawBody, opts = {}) {
         td.setInt32(metaPos + mRead, nowExact, true);
         td.setInt32(metaPos + mRep, nowExact - (origRead - origRep), true);
         td.setInt32(metaPos + mExp, nowExact + (origExp - origRead), true);
+        // beta2 variant (§196): localize the metadata source name in place to
+        // exclude the JMA interference. New strings are shorter than the
+        // originals, so they fit in the original allocations: rewrite the
+        // length prefix, write the bytes, zero the leftover tail. uoffsets
+        // and the vtable are untouched (strings stay at the same positions).
+        const patchMetaString = (fieldIdx, newText) => {
+            const fo = fOff(metaVt, fieldIdx);
+            if (!fo) return false;
+            const strPos = ind(metaPos + fo);
+            const bytes = utf8Bytes(newText);
+            const oldLen = td.getUint32(strPos, true);
+            const oldAlloc = 4 + align4(oldLen);
+            const newAlloc = 4 + align4(bytes.length);
+            if (newAlloc > oldAlloc) return false;
+            td.setUint32(strPos, bytes.length, true);
+            for (let i = 0; i < bytes.length; i++) td.setUint8(strPos + 4 + i, bytes[i]);
+            for (let i = newAlloc; i < oldAlloc; i++) td.setUint8(strPos + i, 0);
+            return true;
+        };
+        if (!patchMetaString(0, 'https://www.caiyunapp.com/h5')) return fail('metadata attributionUrl patch failed');
+        if (!patchMetaString(6, '彩云天气')) return fail('metadata providerName patch failed');
         const walkVec = (fieldIdx, isCond, hasEndTime) => {
             const vo = fOff(nhVt, fieldIdx);
             if (!vo) return;
@@ -2898,9 +2923,19 @@ function transplantWK3NextHourFixed(ByteBuffer, rawBody, opts = {}) {
         const cNamePos = chk.__indirect(cMeta + cNameOff);
         const cNameLen = chk.readUint32(cNamePos);
         const cNameBytes = out.slice(cNamePos + 4, cNamePos + 4 + cNameLen);
-        const expName = utf8Bytes('Japan Meteorological Agency');
+        const expName = utf8Bytes('彩云天气');
         if (cNameLen !== expName.length) return fail('self-check providerName length');
         for (let i = 0; i < cNameLen; i++) if (cNameBytes[i] !== expName[i]) return fail('self-check providerName bytes');
+        // beta2 variant: attributionUrl must be the local value (§189 lesson:
+        // self-checks must cover attributionUrl, not just providerName).
+        const cUrlOff = chk.__offset(cMeta, 4 + 0 * 2);
+        if (!cUrlOff) return fail('self-check attributionUrl absent');
+        const cUrlPos = chk.__indirect(cMeta + cUrlOff);
+        const cUrlLen = chk.readUint32(cUrlPos);
+        const cUrlBytes = out.slice(cUrlPos + 4, cUrlPos + 4 + cUrlLen);
+        const expUrl = utf8Bytes('https://www.caiyunapp.com/h5');
+        if (cUrlLen !== expUrl.length) return fail('self-check attributionUrl length');
+        for (let i = 0; i < cUrlLen; i++) if (cUrlBytes[i] !== expUrl[i]) return fail('self-check attributionUrl bytes');
         const cLatOff = chk.__offset(cMeta, 4 + 3 * 2);
         const cLonOff = chk.__offset(cMeta, 4 + 4 * 2);
         const od2 = new DataView(out.buffer);
@@ -2936,7 +2971,7 @@ function transplantWK3NextHourFixed(ByteBuffer, rawBody, opts = {}) {
         if (aqIdxOff && cAqIdxOff && bb.readInt16(origAq + aqIdxOff) !== chk.readInt16(cAq + cAqIdxOff)) return fail('self-check AQ index changed');
         return {
             body: out,
-            log: `WK3 nhTransplant: slot 5 transplanted (tokyo, FIX1+FIX2) minutes=${TOKYO_NH_COUNTS.minutes} summaries=${TOKYO_NH_COUNTS.summaries} conditions=${TOKYO_NH_COUNTS.conditions} provider=Japan Meteorological Agency window ${cStart}->${origEnd + delta} latlon ${targetLat.toFixed(4)},${targetLon.toFixed(4)} body ${rawBody.length}->${outLen}`,
+            log: `WK3 nhTransplant: slot 5 transplanted (tokyo-local, FIX1+FIX2) minutes=${TOKYO_NH_COUNTS.minutes} summaries=${TOKYO_NH_COUNTS.summaries} conditions=${TOKYO_NH_COUNTS.conditions} provider=彩云天气 window ${cStart}->${origEnd + delta} latlon ${targetLat.toFixed(4)},${targetLon.toFixed(4)} body ${rawBody.length}->${outLen}`,
         };
     } catch (e) {
         return fail(`exception ${e?.message ?? e}`);
