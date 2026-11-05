@@ -166,7 +166,7 @@ export async function Response($request, $response) {
                                             nhReplace = { body: null, log: "WK3 nh: skipped (provider error)" };
                                         }
                                         if (nhData?.minutes?.length) {
-                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData);
+                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { minimal: true }); // BISECT beta2: minimal slot 5 (metadata only)
                                             if (nhReplace.body) {
                                                 workingBody = nhReplace.body;
                                                 workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
@@ -1611,10 +1611,11 @@ const PRECIPITATION_TYPE = { CLEAR: 0, RAIN: 1, SNOW: 2, SLEET: 3, HAIL: 4, MIXE
 const PARAMETER_TYPE = { FIRST_AT: 0, SECOND_AT: 1 };
 const SOURCE_TYPE = { APPLE_INTERNAL: 0, MODELED: 1, STATION: 2 };
 
-function fillWK3NextHour(ByteBuffer, rawBody, nh) {
+function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
+    const minimal = !!opts.minimal; // BISECT beta2: minimal slot 5 (metadata only, empty vectors)
     const fail = log => ({ body: null, log: `WK3 nhFill: skipped (${log})` });
     try {
-        if (!nh || !Array.isArray(nh.minutes) || nh.minutes.length === 0) return fail("no minutes");
+        if (!nh || !Array.isArray(nh.minutes) || (nh.minutes.length === 0 && !minimal)) return fail("no minutes");
         const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
         if (rootPos < 0 || rootPos + 4 > rawBody.length) return fail("root out of range");
         const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
@@ -1632,12 +1633,12 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh) {
 
         // Filter conditions like v2 does: begin/end must be known ConditionType
         // values (FLURRIES/POSSIBLE_FLURRIES are not in the WK2 schema enum).
-        const conditions = (nh.condition || []).filter(c =>
+        const conditions = minimal ? [] : (nh.condition || []).filter(c =>
             typeof CONDITION_TYPE[c.beginCondition] === "number" &&
             typeof CONDITION_TYPE[c.endCondition] === "number" &&
             typeof FORECAST_TOKEN[c.forecastToken] === "number");
-        const summaries = nh.summary || [];
-        const minutes = nh.minutes;
+        const summaries = minimal ? [] : (nh.summary || []);
+        const minutes = minimal ? [] : nh.minutes;
         const md = nh.metadata || {};
 
         const align4 = v => Math.ceil(v / 4) * 4;
@@ -1849,7 +1850,7 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh) {
         }
         return {
             body: out,
-            log: `WK3 nhFill: slot 5 created minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
+            log: `WK3 nhFill: slot 5 created${minimal ? " (minimal bisect)" : ""} minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
         };
     } catch (e) {
         return { body: null, log: `WK3 nhFill: skipped (exception ${e?.message ?? e})` };
