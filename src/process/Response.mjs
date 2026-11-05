@@ -179,29 +179,20 @@ export async function Response($request, $response) {
                                     workingBody = hourlyReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
-                                // 未来一小时填空（WK3 3.4.1-beta8）：按 PR #108 规格重建槽 5
-                                // （§183：beta1–b6 的 writer 照 WK2 形状写，摘要 condition 应为
-                                // 字节向量、枚举应为 1 起值；“存在性即缺陷”是过度概括）。
+                                // 未来一小时移植对照（WK3 3.4.2-beta1）：把真实 Apple 东京槽 5
+                                // 原样拼进本城市的体，判别槽 5 存在性本身是不是 breaker（§187：
+                                // beta8 按 PR #108 规格重建的填空仍被拒收）。填空路线旁路停放，
+                                // fillWK3NextHour 留在文件里，判别后再决定恢复填空还是停放 NextHour。
                                 // 只在 forecastNextHour 在 dataSets 且国家在 Replace 时跑；
-                                // provider 默认彩云（InjectForecastNextHour 默认分支），
-                                // 窗口移至今；任一失败原样返回，不影响其他槽。
-                                // transplantWK3NextHour 仍停用、保留在文件里备查。
+                                // 不取 provider 数据（移植用的是东京真字节）；任一失败原样返回，
+                                // 不影响其他槽。面板若出现，显示的是东京的雨（对照本意，不是 bug）。
                                 let nhReplace = { body: null, log: "WK3 nh: skipped (not attempted)" };
                                 if (parameters.dataSets.includes("forecastNextHour") && Settings?.Weather?.Replace?.includes(parameters.country)) {
                                     try {
-                                        const nhEnv = {
-                                            colorfulClouds: new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ=="),
-                                            qWeather: new QWeather({ ...parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host),
-                                        };
-                                        const nhData = await InjectForecastNextHour(undefined, Settings, nhEnv);
-                                        if (nhData) {
-                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { shiftToNow: true });
-                                            if (nhReplace.body) {
-                                                workingBody = nhReplace.body;
-                                                workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
-                                            }
-                                        } else {
-                                            nhReplace = { body: null, log: "WK3 nh: skipped (no provider data)" };
+                                        nhReplace = transplantWK3NextHourFixed(workingByteBuffer, workingBody);
+                                        if (nhReplace.body) {
+                                            workingBody = nhReplace.body;
+                                            workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                         }
                                     } catch (e) {
                                         nhReplace = { body: null, log: `WK3 nh: skipped (exception ${e?.message ?? e})` };
@@ -2709,7 +2700,8 @@ const WK3_NH_SOURCE = { MODELED: 2, STATION: 3 };
 // 只改窗口（移至今）、元数据经纬度（改目标城）与元数据三时间
 // （保留原时长与上报-读取间隔）。不拉 provider、不调 fill。
 // blob 布局：[NH vtable 16][NH 表 28] 开头，NH 表在 blob+16。
-const TOKYO_NH_HEX = "10001c001800140010000c0008000400100000001c010000f400eb6a80edea6ae4000000b4000000200000001a00240020001c00000018001400000010000c0008000000070000001c00000000000002dcebea6a84edea6a6000000014ce0b439a190f4208f1ea6a040000004800000068747470733a2f2f646576656c6f7065722e6170706c652e636f6d2f776561746865726b69742f646174612d736f757263652d6174747269627574696f6e2d696e7465726e616c2f1b0000004a6170616e204d6574656f726f6c6f676963616c204167656e6379000100000014000000100010000c0000000b000a0009000400100000000c0000000007070680edea6a0000000001000000140000000e001400100000000c000b0004000000100000003358a140000000640800000080edea6a53000000580100007401000090010000ac010000c8010000e4010000000200001c0200003802000054020000700200008c020000a8020000c4020000e0020000fc0200001803000034030000500300006c03000088030000a4030000c0030000dc030000f803000014040000300400004c0400006804000084040000a0040000bc040000d8040000f4040000100500002c0500004805000064050000800500009c050000b8050000d4050000f00500000c0600002806000044060000600600007c06000098060000b4060000d0060000ec0600000807000024070000400700005c0700007807000094070000b0070000cc070000e807000004080000200800003c080000580800007408000090080000ac080000c8080000e4080000000900001c0900003809000054090000700900008c090000a8090000c4090000e0090000fc090000180a0000340a0000500a00000c00140010000f0008000400ccf5ffff9a99993f995fb43f0000006480edea6a0c00140010000f0008000400ecf5ffff17d99e3f815fc43f00000064bcedea6a0c00140010000f00080004000cf6ffff5839a43fbecad53f00000064f8edea6a0c00140010000f00080004002cf6ffff7f6aac3f1cdcf23f0000006434eeea6a0c00140010000f00080004004cf6ffff4a0cb23f7c3304400000006470eeea6a0c00140010000f00080004006cf6fffffa7eba3ff12c164000000064aceeea6a0c00140010000f00080004008cf6ffff4e62c03f207f234000000064e8eeea6a0c00140010000f0008000400acf6ffffa245c63fceff31400000006424efea6a0c00140010000f0008000400ccf6fffff628cc3fd0c941400000006460efea6a0c00140010000f0008000400ecf6ffff0e2dd23f5bfa5240000000649cefea6a0c00140010000f00080004000cf7ffff7d3fd53fe7225c4000000064d8efea6a0c00140010000f00080004002cf7ffffec51d83f3ab165400000006414f0ea6a0c00140010000f00080004004cf7ffff9643db3fc2a96f400000006450f0ea6a0c00140010000f00080004006cf7ffff9643db3fc2a96f40000000648cf0ea6a0c00140010000f00080004008cf7ffff0456de3f18117a4000000064c8f0ea6a0c00140010000f0008000400acf7ffff0456de3f18117a400000006404f1ea6a0c00140010000f0008000400ccf7ffff0456de3f18117a400000006440f1ea6a0c00140010000f0008000400ecf7ffff0456de3f18117a40000000647cf1ea6a0c00140010000f00080004000cf8ffff9643db3fc2a96f4000000064b8f1ea6a0c00140010000f00080004002cf8ffff9643db3fc2a96f4000000064f4f1ea6a0c00140010000f00080004004cf8ffff9643db3fc2a96f400000006430f2ea6a0c00140010000f00080004006cf8ffffec51d83f3ab16540000000646cf2ea6a0c00140010000f00080004008cf8ffff7d3fd53fe7225c4000000064a8f2ea6a0c00140010000f0008000400acf8ffff0e2dd23f5bfa524000000064e4f2ea6a0c00140010000f0008000400ccf8ffff643bcf3f55334a400000006420f3ea6a0c00140010000f0008000400ecf8fffff628cc3fd0c94140000000645cf3ea6a0c00140010000f00080004000cf9ffff4c37c93fdeb939400000006498f3ea6a0c00140010000f00080004002cf9ffffa245c63fceff314000000064d4f3ea6a0c00140010000f00080004004cf9ffff4e62c03f207f23400000006410f4ea6a0c00140010000f00080004006cf9fffffa7eba3ff12c1640000000644cf4ea6a0c00140010000f00080004008cf9ffff14aeb73f81ed0f400000006488f4ea6a0c00140010000f0008000400acf9ffff4a0cb23f7c33044000000064c4f4ea6a0c00140010000f0008000400ccf9ffff7f6aac3f1cdcf23f0000006400f5ea6a0c00140010000f0008000400ecf9ffff79e9a63f9412df3f000000643cf5ea6a0c00140010000f00080004000cfaffff5839a43fbecad53f0000006478f5ea6a0c00140010000f00080004002cfaffff17d99e3f815fc43f00000064b4f5ea6a0c00140010000f00080004004cfaffffba499c3f0c34bc3f00000064f0f5ea6a0c00140010000f00080004006cfaffff9a99993f995fb43f000000642cf6ea6a0c00140010000f00080004008cfaffff3d0a973f88deac3f0000006468f6ea6a0c00140010000f0008000400acfaffffa69b943f66ada53f00000064a4f6ea6a0c00140010000f0008000400ccfaffff4a0c923fdac89e3f00000064e0f6ea6a0c00140010000f0008000400ecfaffff4a0c923fdac89e3f000000641cf7ea6a0c00140010000f00080004000cfbffff4a0c923fdac89e3f0000006458f7ea6a0c00140010000f00080004002cfbffffa69b943f66ada53f0000006494f7ea6a0c00140010000f00080004004cfbffffa69b943f66ada53f00000064d0f7ea6a0c00140010000f00080004006cfbffff3d0a973f88deac3f000000640cf8ea6a0c00140010000f00080004008cfbffff9a99993f995fb43f0000006448f8ea6a0c00140010000f0008000400acfbffffba499c3f0c34bc3f0000006484f8ea6a0c00140010000f0008000400ccfbffff17d99e3f815fc43f00000064c0f8ea6a0c00140010000f0008000400ecfbffff5839a43fbecad53f00000064fcf8ea6a0c00140010000f00080004000cfcffff79e9a63f9412df3f0000006438f9ea6a0c00140010000f00080004002cfcffff7f6aac3f1cdcf23f0000006474f9ea6a0c00140010000f00080004004cfcffff4a0cb23f7c33044000000064b0f9ea6a0c00140010000f00080004006cfcffff2fddb43f9af0094000000064ecf9ea6a0c00140010000f00080004008cfcfffffa7eba3ff12c16400000006428faea6a0c00140010000f0008000400acfcffff4e62c03f207f23400000006464faea6a0c00140010000f0008000400ccfcfffff853c33f06982a4000000064a0faea6a0c00140010000f0008000400ecfcffff4c37c93fdeb9394000000064dcfaea6a0c00140010000f00080004000cfdfffff628cc3fd0c941400000006418fbea6a0c00140010000f00080004002cfdffff0e2dd23f5bfa52400000006454fbea6a0c00140010000f00080004004cfdffff7d3fd53fe7225c400000006490fbea6a0c00140010000f00080004006cfdffffec51d83f3ab1654000000064ccfbea6a0c00140010000f00080004008cfdffff9643db3fc2a96f400000006408fcea6a0c00140010000f0008000400acfdffff0456de3f18117a400000006444fcea6a0c00140010000f0008000400ccfdffff7368e13f017682400000006480fcea6a0c00140010000f0008000400ecfdffffa69be43fcb1f884000000064bcfcea6a0c00140010000f00080004000cfeffffa69be43fcb1f884000000064f8fcea6a0c00140010000f00080004002cfeffff14aee73f85088e400000006434fdea6a0c00140010000f00080004004cfeffff83c0ea3fea3294400000006470fdea6a0c00140010000f00080004006cfeffff83c0ea3fea32944000000064acfdea6a0c00140010000f00080004008cfeffff83c0ea3fea32944000000064e8fdea6a0c00140010000f0008000400acfefffff2d2ed3fcda19a400000006424feea6a0c00140010000f0008000400ccfefffff2d2ed3fcda19a400000006360feea6a0c00140010000f0008000400ecfefffff2d2ed3fcda19a40000000639cfeea6a0c00140010000f00080004000cffffff60e5f03f3358a14000000063d8feea6a0c00140010000f00080004002cffffff60e5f03f3358a1400000006314ffea6a0c00140010000f00080004004cffffff60e5f03f3358a1400000006350ffea6a0c00140010000f00080004006cffffff60e5f03f3358a140000000628cffea6a0c00140010000f00080004008cffffff60e5f03f3358a14000000062c8ffea6a0c00140010000f0008000400acffffff60e5f03f3358a140000000620400eb6a0c00140010000f0008000400ccffffff60e5f03f3358a140000000624000eb6a0c00140010000f0008000400ecffffff60e5f03f3358a140000000627c00eb6a0c00140010000f00080004000c00000060e5f03f3358a14000000061b800eb6a";
+const TOKYO_NH_BLOB_HEX = "10001c001800140010000c00080004001000000018000000f400eb6a80edea6ae4070000140800003c08000053000000c00700009c070000840700006c070000540700003c070000240700000c070000f4060000dc060000c4060000ac060000940600007c060000640600004c060000340600001c06000004060000ec050000d4050000bc050000a40500008c050000740500005c050000440500002c05000014050000fc040000e4040000cc040000b40400009c040000840400006c040000540400003c040000240400000c040000f4030000dc030000c4030000ac030000940300007c030000640300004c030000340300001c03000004030000ec020000d4020000bc020000a40200008c020000740200005c020000440200002c02000014020000fc010000e4010000cc010000b40100009c010000840100006c010000540100003c010000240100000c010000f4000000dc000000c4000000ac000000940000007c000000640000004c000000340000001c0000000400000098f9ffff60e5f03f3358a14000000061b800eb6aacf9ffff60e5f03f3358a140000000627c00eb6ac0f9ffff60e5f03f3358a140000000624000eb6ad4f9ffff60e5f03f3358a140000000620400eb6ae8f9ffff60e5f03f3358a14000000062c8ffea6afcf9ffff60e5f03f3358a140000000628cffea6a10faffff60e5f03f3358a1400000006350ffea6a24faffff60e5f03f3358a1400000006314ffea6a38faffff60e5f03f3358a14000000063d8feea6a4cfafffff2d2ed3fcda19a40000000639cfeea6a60fafffff2d2ed3fcda19a400000006360feea6a74fafffff2d2ed3fcda19a400000006424feea6a88faffff83c0ea3fea32944000000064e8fdea6a9cfaffff83c0ea3fea32944000000064acfdea6ab0faffff83c0ea3fea3294400000006470fdea6ac4faffff14aee73f85088e400000006434fdea6ad8faffffa69be43fcb1f884000000064f8fcea6aecfaffffa69be43fcb1f884000000064bcfcea6a00fbffff7368e13f017682400000006480fcea6a14fbffff0456de3f18117a400000006444fcea6a28fbffff9643db3fc2a96f400000006408fcea6a3cfbffffec51d83f3ab1654000000064ccfbea6a50fbffff7d3fd53fe7225c400000006490fbea6a64fbffff0e2dd23f5bfa52400000006454fbea6a78fbfffff628cc3fd0c941400000006418fbea6a8cfbffff4c37c93fdeb9394000000064dcfaea6aa0fbfffff853c33f06982a4000000064a0faea6ab4fbffff4e62c03f207f23400000006464faea6ac8fbfffffa7eba3ff12c16400000006428faea6adcfbffff2fddb43f9af0094000000064ecf9ea6af0fbffff4a0cb23f7c33044000000064b0f9ea6a04fcffff7f6aac3f1cdcf23f0000006474f9ea6a18fcffff79e9a63f9412df3f0000006438f9ea6a2cfcffff5839a43fbecad53f00000064fcf8ea6a40fcffff17d99e3f815fc43f00000064c0f8ea6a54fcffffba499c3f0c34bc3f0000006484f8ea6a68fcffff9a99993f995fb43f0000006448f8ea6a7cfcffff3d0a973f88deac3f000000640cf8ea6a90fcffffa69b943f66ada53f00000064d0f7ea6aa4fcffffa69b943f66ada53f0000006494f7ea6ab8fcffff4a0c923fdac89e3f0000006458f7ea6accfcffff4a0c923fdac89e3f000000641cf7ea6ae0fcffff4a0c923fdac89e3f00000064e0f6ea6af4fcffffa69b943f66ada53f00000064a4f6ea6a08fdffff3d0a973f88deac3f0000006468f6ea6a1cfdffff9a99993f995fb43f000000642cf6ea6a30fdffffba499c3f0c34bc3f00000064f0f5ea6a44fdffff17d99e3f815fc43f00000064b4f5ea6a58fdffff5839a43fbecad53f0000006478f5ea6a6cfdffff79e9a63f9412df3f000000643cf5ea6a80fdffff7f6aac3f1cdcf23f0000006400f5ea6a94fdffff4a0cb23f7c33044000000064c4f4ea6aa8fdffff14aeb73f81ed0f400000006488f4ea6abcfdfffffa7eba3ff12c1640000000644cf4ea6ad0fdffff4e62c03f207f23400000006410f4ea6ae4fdffffa245c63fceff314000000064d4f3ea6af8fdffff4c37c93fdeb939400000006498f3ea6a0cfefffff628cc3fd0c94140000000645cf3ea6a20feffff643bcf3f55334a400000006420f3ea6a34feffff0e2dd23f5bfa524000000064e4f2ea6a48feffff7d3fd53fe7225c4000000064a8f2ea6a5cfeffffec51d83f3ab16540000000646cf2ea6a70feffff9643db3fc2a96f400000006430f2ea6a84feffff9643db3fc2a96f4000000064f4f1ea6a98feffff9643db3fc2a96f4000000064b8f1ea6aacfeffff0456de3f18117a40000000647cf1ea6ac0feffff0456de3f18117a400000006440f1ea6ad4feffff0456de3f18117a400000006404f1ea6ae8feffff0456de3f18117a4000000064c8f0ea6afcfeffff9643db3fc2a96f40000000648cf0ea6a10ffffff9643db3fc2a96f400000006450f0ea6a24ffffffec51d83f3ab165400000006414f0ea6a38ffffff7d3fd53fe7225c4000000064d8efea6a4cffffff0e2dd23f5bfa5240000000649cefea6a60fffffff628cc3fd0c941400000006460efea6a74ffffffa245c63fceff31400000006424efea6a88ffffff4e62c03f207f234000000064e8eeea6a9cfffffffa7eba3ff12c164000000064aceeea6ab0ffffff4a0cb23f7c3304400000006470eeea6ac4ffffff7f6aac3f1cdcf23f0000006434eeea6ad8ffffff5839a43fbecad53f00000064f8edea6aecffffff17d99e3f815fc43f00000064bcedea6a0c00140010000f00080004000c0000009a99993f995fb43f0000006480edea6a010000001400000000000e001400100000000c000b0004000e0000003358a140000000640800000080edea6a01000000020000000100000014000000100010000c0000000b000a0009000400100000000c0000000007070680edea6a00000000da37ffff00000002dcebea6a84edea6a1400000014ce0b439a190f4208f1ea6a240000001b0000004a6170616e204d6574656f726f6c6f676963616c204167656e6379004800000068747470733a2f2f646576656c6f7065722e6170706c652e636f6d2f776561746865726b69742f646174612d736f757263652d6174747269627574696f6e2d696e7465726e616c2f"; // Tokyo capture[896:3188], 2292 bytes (real Apple bytes, §190; NOT the old re-serialized TOKYO_NH_HEX)
+const TOKYO_NH_META_VT_HEX = "1a00240020001c00000018001400000010000c00080000000700"; // Tokyo capture[54282:54308], 26 bytes (shared metadata vtable, FIX 2)
 function hexToBytes(hex) {
     const out = new Uint8Array(hex.length / 2);
     for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -2721,7 +2713,27 @@ function utf8Bytes(str) {
     for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
     return out;
 }
-function transplantWK3NextHour(ByteBuffer, rawBody) {
+// ---- WK3 NextHour transplant control (3.4.2-beta1): splice the REAL Apple Tokyo
+// slot 5 into a slot-5-less body, to test on-device whether slot 5's EXISTENCE is
+// the breaker (§187: the beta8 fill per PR #108 spec was still rejected).
+// The blob is the real capture bytes (Tokyo capture[896:3188], 2292 bytes) — NOT the
+// old TOKYO_NH_HEX, which was a re-serialized version (§190). The metadata vtable
+// is shared with slot-0 AQ metadata in the Tokyo body (at 54282), so it is embedded
+// separately and appended to the blob (FIX 2). Loon has no filesystem, so both byte
+// strings are embedded as hex constants below (extracted offline, verified against
+// the capture in beta1-342-extract.mjs).
+// FIX 1 (§183): root vtable TABLE-SIZE field bumped +4 (the old transplant forgot).
+// FIX 2 (§190): metadata vtable copy appended to the blob, soffset repointed.
+// providerName stays "Japan Meteorological Agency"; lat/lon are set to the target
+// city's (from the base body's slot-0 AQ metadata); times shift uniformly to now
+// (minute-floored window start, readTime = exact now — Apple's pattern).
+// Any failure returns the original body. fillWK3NextHour stays in the file, parked,
+// so the fill route can be restored after this control.
+const TOKYO_NH_META_TABLE_OFF = 2148; // metadata table offset inside the blob
+const TOKYO_NH_COUNTS = { minutes: 83, summaries: 1, conditions: 1 };
+function transplantWK3NextHourFixed(ByteBuffer, rawBody, opts = {}) {
+    const align4 = (v) => (v + 3) & ~3;
+    const align8 = (v) => (v + 7) & ~7;
     const fail = (reason) => ({ body: null, log: `WK3 nhTransplant: skipped (${reason})` });
     try {
         const bb = ByteBuffer;
@@ -2729,60 +2741,78 @@ function transplantWK3NextHour(ByteBuffer, rawBody) {
         const rootVtablePos = rootPos - bb.readInt32(rootPos);
         const rootVtableLen = bb.readUint16(rootVtablePos);
         const rootTableSize = bb.readUint16(rootVtablePos + 2);
-        if (rootVtableLen !== 15 * 2 + 4) return fail("root not 15 fields");
-        if (bb.__offset(rootPos, 4 + 5 * 2)) return fail("slot 5 present");
-        // 目标城经纬度：取槽 0 AQ 元数据 float32 lat/lon（字段 3/4）
-        const slot0Off = bb.__offset(rootPos, 4 + 0 * 2);
-        if (!slot0Off) return fail("slot 0 absent");
-        const aqTable = bb.__indirect(rootPos + slot0Off);
-        const aqMetaOff = bb.__offset(aqTable, 4 + 0 * 2);
-        if (!aqMetaOff) return fail("AQ metadata absent");
-        const aqMeta = bb.__indirect(aqTable + aqMetaOff);
-        const latOff = bb.__offset(aqMeta, 4 + 3 * 2);
-        const lonOff = bb.__offset(aqMeta, 4 + 4 * 2);
-        if (!latOff || !lonOff) return fail("AQ lat/lon absent");
-        const dv = new DataView(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength);
-        const targetLat = dv.getFloat32(aqMeta + latOff, true);
-        const targetLon = dv.getFloat32(aqMeta + lonOff, true);
-        if (!Number.isFinite(targetLat) || !Number.isFinite(targetLon)) return fail("AQ lat/lon not finite");
-        // 复制移植 blob 并打补丁（字段偏移一律读各表自己的 vtable，东京打包与我方不同）
-        const tpl = hexToBytes(TOKYO_NH_HEX);
+        if (rootVtableLen !== 15 * 2 + 4) return fail('root not 15 fields');
+        if (bb.__offset(rootPos, 4 + 5 * 2)) return fail('slot 5 present');
+        // Target lat/lon: explicit override, else base body's slot-0 AQ metadata.
+        let targetLat = opts.targetLat, targetLon = opts.targetLon;
+        if (targetLat === undefined || targetLon === undefined) {
+            const slot0Off = bb.__offset(rootPos, 4 + 0 * 2);
+            if (!slot0Off) return fail('slot 0 absent');
+            const aqTable = bb.__indirect(rootPos + slot0Off);
+            const aqMetaOff = bb.__offset(aqTable, 4 + 0 * 2);
+            if (!aqMetaOff) return fail('AQ metadata absent');
+            const aqMeta = bb.__indirect(aqTable + aqMetaOff);
+            const latOff = bb.__offset(aqMeta, 4 + 3 * 2);
+            const lonOff = bb.__offset(aqMeta, 4 + 4 * 2);
+            if (!latOff || !lonOff) return fail('AQ lat/lon absent');
+            const dv = new DataView(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength);
+            const la = dv.getFloat32(aqMeta + latOff, true);
+            const lo = dv.getFloat32(aqMeta + lonOff, true);
+            if (!Number.isFinite(la) || !Number.isFinite(lo)) return fail('AQ lat/lon not finite');
+            if (targetLat === undefined) targetLat = la;
+            if (targetLon === undefined) targetLon = lo;
+        }
+        // Embedded real Tokyo blob + shared metadata vtable (no filesystem in Loon).
+        const extBlob = hexToBytes(TOKYO_NH_BLOB_HEX);
+        const extMetaVtable = hexToBytes(TOKYO_NH_META_VT_HEX);
+        // FIX 2: append a copy of the shared metadata vtable to the blob and
+        // repoint the metadata table's soffset at the copy.
+        const tpl = new Uint8Array(align4(extBlob.length) + align4(extMetaVtable.length));
+        tpl.set(extBlob, 0);
+        const vtCopyOff = align4(extBlob.length);
+        tpl.set(extMetaVtable, vtCopyOff);
         const td = new DataView(tpl.buffer);
-        const nhPos = 16;
+        const nhPos = 16; // nh table is at blob offset 16 (vtable 0..16, table 16..)
         const nhVt = nhPos - td.getInt32(nhPos, true);
+        // Metadata table position (relative to blob start) and its new soffset.
+        const metaTablePos = TOKYO_NH_META_TABLE_OFF;
+        td.setInt32(metaTablePos, metaTablePos - vtCopyOff, true);
         const fOff = (vt, f) => {
             const vlen = td.getUint16(vt, true);
             return (4 + f * 2 < vlen) ? td.getUint16(vt + 4 + f * 2, true) : 0;
         };
         const ind = (pos) => pos + td.getUint32(pos, true);
-        const now = Math.trunc(Date.now() / 1000);
+        const nowExact = Math.trunc(Date.now() / 1000);
+        const nowFloor = nowExact - (nowExact % 60);
         const startOff = fOff(nhVt, 3);
         const endOff = fOff(nhVt, 4);
-        if (!startOff || !endOff) return fail("NH window fields absent");
+        if (!startOff || !endOff) return fail('NH window fields absent');
         const origStart = td.getInt32(nhPos + startOff, true);
         const origEnd = td.getInt32(nhPos + endOff, true);
-        const delta = now - origStart;
+        const delta = opts.shiftToNow === false ? 0 : (nowFloor - origStart);
         const shift = (tablePos, vtPos, field) => {
             const o = fOff(vtPos, field);
             if (o) td.setInt32(tablePos + o, td.getInt32(tablePos + o, true) + delta, true);
         };
-        td.setInt32(nhPos + startOff, now, true);
+        td.setInt32(nhPos + startOff, origStart + delta, true);
         td.setInt32(nhPos + endOff, origEnd + delta, true);
         const metaOff = fOff(nhVt, 0);
-        if (!metaOff) return fail("NH metadata absent");
+        if (!metaOff) return fail('NH metadata absent');
         const metaPos = ind(nhPos + metaOff);
         const metaVt = metaPos - td.getInt32(metaPos, true);
         const mLat = fOff(metaVt, 3), mLon = fOff(metaVt, 4);
         const mExp = fOff(metaVt, 1), mRead = fOff(metaVt, 7), mRep = fOff(metaVt, 8);
-        if (!mLat || !mLon || !mExp || !mRead || !mRep) return fail("metadata fields absent");
+        if (!mLat || !mLon || !mExp || !mRead || !mRep) return fail('metadata fields absent');
         const origRead = td.getInt32(metaPos + mRead, true);
         const origExp = td.getInt32(metaPos + mExp, true);
         const origRep = td.getInt32(metaPos + mRep, true);
         td.setFloat32(metaPos + mLat, Math.fround(targetLat), true);
         td.setFloat32(metaPos + mLon, Math.fround(targetLon), true);
-        td.setInt32(metaPos + mRead, now, true);
-        td.setInt32(metaPos + mRep, now - (origRead - origRep), true);
-        td.setInt32(metaPos + mExp, now + (origExp - origRead), true);
+        // Metadata times keep their relative offsets; readTime = exact now (Apple
+        // pattern: Tokyo readTime is 4s after forecastStart, not minute-floored).
+        td.setInt32(metaPos + mRead, nowExact, true);
+        td.setInt32(metaPos + mRep, nowExact - (origRead - origRep), true);
+        td.setInt32(metaPos + mExp, nowExact + (origExp - origRead), true);
         const walkVec = (fieldIdx, isCond, hasEndTime) => {
             const vo = fOff(nhVt, fieldIdx);
             if (!vo) return;
@@ -2811,10 +2841,8 @@ function transplantWK3NextHour(ByteBuffer, rawBody) {
         };
         walkVec(1, true, true);
         walkVec(2, false, true);
-        walkVec(5, false, false); // 分钟表字段 1 是 int8 概率，不是 endTime，不移
-        // 拼装：[新根 uoffset][新根 vtable][新根表][移植 blob][原体 blob]
-        const align4 = (v) => (v + 3) & ~3;
-        const align8 = (v) => (v + 7) & ~7;
+        walkVec(5, false, false); // minute field 1 is u8 chance, not endTime: do not shift
+        // ---- assemble: [new root uoffset][new root vtable][new root table][tpl blob][orig body] ----
         const newRootVtablePos = 4;
         const newRootPos = align4(newRootVtablePos + rootVtableLen);
         const newRootTableSize = rootTableSize + 4;
@@ -2825,6 +2853,8 @@ function transplantWK3NextHour(ByteBuffer, rawBody) {
         const od = new DataView(out.buffer);
         od.setUint32(0, newRootPos, true);
         out.set(rawBody.slice(rootVtablePos, rootVtablePos + rootVtableLen), newRootVtablePos);
+        // FIX 1 (§183): bump the root vtable's TABLE-SIZE field (was missing).
+        od.setUint16(newRootVtablePos + 2, newRootTableSize, true);
         od.setUint16(newRootVtablePos + 4 + 5 * 2, rootTableSize, true);
         out.set(rawBody.slice(rootPos, rootPos + rootTableSize), newRootPos);
         od.setInt32(newRootPos, newRootPos - newRootVtablePos, true);
@@ -2840,37 +2870,43 @@ function transplantWK3NextHour(ByteBuffer, rawBody) {
             const newTarget = oldTarget + blobOffset;
             od.setUint32(newRootPos + o, newTarget - (newRootPos + o), true);
         }
-        // 自检：真实 flatbuffers 读回
+        // ---- self-check: real flatbuffers read-back + PR decoder round-trip ----
         const chk = new flatbuffers.ByteBuffer(out);
         const chkRoot = chk.readInt32(chk.position()) + chk.position();
         const chkRootVt = chkRoot - chk.readInt32(chkRoot);
-        if (chk.readUint16(chkRootVt) !== 15 * 2 + 4) return fail("self-check root fields");
+        if (chk.readUint16(chkRootVt) !== 15 * 2 + 4) return fail('self-check root fields');
+        if (chk.readUint16(chkRootVt + 2) !== newRootTableSize) return fail('self-check root table size not bumped (FIX 1)');
         const s5 = chk.__offset(chkRoot, 4 + 5 * 2);
-        if (!s5) return fail("self-check slot 5 absent");
+        if (!s5) return fail('self-check slot 5 absent');
+        if (s5 >= newRootTableSize) return fail('self-check slot 5 entry outside declared table size');
         const cNh = chk.__indirect(chkRoot + s5);
         const cNhVt = cNh - chk.readInt32(cNh);
         const cStartOff = chk.readUint16(cNhVt + 4 + 3 * 2);
-        if (!cStartOff) return fail("self-check NH start absent");
+        if (!cStartOff) return fail('self-check NH start absent');
         const cStart = chk.readInt32(cNh + cStartOff);
-        if (Math.abs(cStart - now) > 5) return fail("self-check window start != now");
+        if (opts.shiftToNow !== false && Math.abs(cStart - nowFloor) > 2) return fail('self-check window start != nowFloor');
         const cMetaOff = chk.__offset(cNh, 4 + 0 * 2);
-        if (!cMetaOff) return fail("self-check metadata absent");
+        if (!cMetaOff) return fail('self-check metadata absent');
         const cMeta = chk.__indirect(cNh + cMetaOff);
         const cMetaVt = cMeta - chk.readInt32(cMeta);
+        // FIX 2 check: the metadata vtable must now lie inside this body, inside
+        // the transplant blob region, and be byte-identical to Apple's vtable.
+        if (cMetaVt < tplPos || cMetaVt + 26 > tplPos + tpl.length) return fail('self-check metadata vtable outside transplant blob (FIX 2)');
+        for (let i = 0; i < 26; i++) if (out[cMetaVt + i] !== extMetaVtable[i]) return fail('self-check metadata vtable bytes differ from Apple');
         const cNameOff = chk.__offset(cMeta, 4 + 6 * 2);
-        if (!cNameOff) return fail("self-check providerName absent");
+        if (!cNameOff) return fail('self-check providerName absent');
         const cNamePos = chk.__indirect(cMeta + cNameOff);
         const cNameLen = chk.readUint32(cNamePos);
         const cNameBytes = out.slice(cNamePos + 4, cNamePos + 4 + cNameLen);
-        const expName = utf8Bytes("Japan Meteorological Agency");
-        if (cNameLen !== expName.length) return fail("self-check providerName length");
-        for (let i = 0; i < cNameLen; i++) if (cNameBytes[i] !== expName[i]) return fail("self-check providerName bytes");
+        const expName = utf8Bytes('Japan Meteorological Agency');
+        if (cNameLen !== expName.length) return fail('self-check providerName length');
+        for (let i = 0; i < cNameLen; i++) if (cNameBytes[i] !== expName[i]) return fail('self-check providerName bytes');
         const cLatOff = chk.__offset(cMeta, 4 + 3 * 2);
         const cLonOff = chk.__offset(cMeta, 4 + 4 * 2);
         const od2 = new DataView(out.buffer);
-        if (!cLatOff || !cLonOff) return fail("self-check meta lat/lon absent");
-        if (od2.getFloat32(cMeta + cLatOff, true) !== Math.fround(targetLat)) return fail("self-check lat");
-        if (od2.getFloat32(cMeta + cLonOff, true) !== Math.fround(targetLon)) return fail("self-check lon");
+        if (!cLatOff || !cLonOff) return fail('self-check meta lat/lon absent');
+        if (od2.getFloat32(cMeta + cLatOff, true) !== Math.fround(targetLat)) return fail('self-check lat');
+        if (od2.getFloat32(cMeta + cLonOff, true) !== Math.fround(targetLon)) return fail('self-check lon');
         const vecCheck = (fieldIdx, expectLen) => {
             const vo = chk.__offset(cNh, 4 + fieldIdx * 2);
             if (!vo) return false;
@@ -2883,21 +2919,25 @@ function transplantWK3NextHour(ByteBuffer, rawBody) {
             }
             return true;
         };
-        if (!vecCheck(1, 1) || !vecCheck(2, 1) || !vecCheck(5, 83)) return fail("self-check vectors");
+        if (!vecCheck(1, TOKYO_NH_COUNTS.conditions) || !vecCheck(2, TOKYO_NH_COUNTS.summaries) || !vecCheck(5, TOKYO_NH_COUNTS.minutes)) return fail('self-check vectors');
         const cMinVec = chk.__indirect(cNh + chk.__offset(cNh, 4 + 5 * 2));
         const cMin0 = cMinVec + 4 + chk.readUint32(cMinVec + 4);
         const cMin0Vt = cMin0 - chk.readInt32(cMin0);
         const cMin0StartOff = chk.readUint16(cMin0Vt + 4 + 0 * 2);
-        if (!cMin0StartOff || chk.readInt32(cMin0 + cMin0StartOff) !== cStart) return fail("self-check minute[0] start");
-        // 槽 0 AQ 类别/指数未被扰动
-        const aqCatOff = bb.__offset(aqTable, 4 + 1 * 2);
-        const aqIdxOff = bb.__offset(aqTable, 4 + 2 * 2);
+        if (!cMin0StartOff || chk.readInt32(cMin0 + cMin0StartOff) !== cStart) return fail('self-check minute[0] start');
+        // Base-body slots untouched: AQ category/index.
+        const aqCatOff = bb.__offset(bb.__indirect(rootPos + bb.__offset(rootPos, 4 + 0 * 2)), 4 + 1 * 2);
+        const aqIdxOff = bb.__offset(bb.__indirect(rootPos + bb.__offset(rootPos, 4 + 0 * 2)), 4 + 2 * 2);
         const cAq = chk.__indirect(chkRoot + chk.__offset(chkRoot, 4 + 0 * 2));
         const cAqCatOff = chk.__offset(cAq, 4 + 1 * 2);
         const cAqIdxOff = chk.__offset(cAq, 4 + 2 * 2);
-        if (aqCatOff && cAqCatOff && bb.readInt8(aqTable + aqCatOff) !== chk.readInt8(cAq + cAqCatOff)) return fail("self-check AQ category changed");
-        if (aqIdxOff && cAqIdxOff && bb.readInt16(aqTable + aqIdxOff) !== chk.readInt16(cAq + cAqIdxOff)) return fail("self-check AQ index changed");
-        return { body: out, log: `WK3 nhTransplant: slot 5 transplanted (tokyo) window ${now}->${origEnd + delta} latlon ${targetLat.toFixed(4)},${targetLon.toFixed(4)} body ${rawBody.length}->${outLen}` };
+        const origAq = bb.__indirect(rootPos + bb.__offset(rootPos, 4 + 0 * 2));
+        if (aqCatOff && cAqCatOff && bb.readInt8(origAq + aqCatOff) !== chk.readInt8(cAq + cAqCatOff)) return fail('self-check AQ category changed');
+        if (aqIdxOff && cAqIdxOff && bb.readInt16(origAq + aqIdxOff) !== chk.readInt16(cAq + cAqIdxOff)) return fail('self-check AQ index changed');
+        return {
+            body: out,
+            log: `WK3 nhTransplant: slot 5 transplanted (tokyo, FIX1+FIX2) minutes=${TOKYO_NH_COUNTS.minutes} summaries=${TOKYO_NH_COUNTS.summaries} conditions=${TOKYO_NH_COUNTS.conditions} provider=Japan Meteorological Agency window ${cStart}->${origEnd + delta} latlon ${targetLat.toFixed(4)},${targetLon.toFixed(4)} body ${rawBody.length}->${outLen}`,
+        };
     } catch (e) {
         return fail(`exception ${e?.message ?? e}`);
     }
