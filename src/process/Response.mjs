@@ -166,7 +166,7 @@ export async function Response($request, $response) {
                                             nhReplace = { body: null, log: "WK3 nh: skipped (provider error)" };
                                         }
                                         if (nhData?.minutes?.length) {
-                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { shiftToNow: true }); // BISECT beta3: full fill, window shifted to now
+                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { windowOnly: true, shiftToNow: true }); // BISECT beta5: window-only slot 5, window shifted to now
                                             if (nhReplace.body) {
                                                 workingBody = nhReplace.body;
                                                 workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
@@ -1613,9 +1613,10 @@ const SOURCE_TYPE = { APPLE_INTERNAL: 0, MODELED: 1, STATION: 2 };
 
 function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
     const minimal = !!opts.minimal; // BISECT beta2: minimal slot 5 (metadata only, empty vectors)
+    const windowOnly = !!opts.windowOnly; // BISECT beta5: window-only slot 5 (no metadata, no vectors)
     const fail = log => ({ body: null, log: `WK3 nhFill: skipped (${log})` });
     try {
-        if (!nh || !Array.isArray(nh.minutes) || (nh.minutes.length === 0 && !minimal)) return fail("no minutes");
+        if (!nh || !Array.isArray(nh.minutes) || (nh.minutes.length === 0 && !minimal && !windowOnly)) return fail("no minutes");
         const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
         if (rootPos < 0 || rootPos + 4 > rawBody.length) return fail("root out of range");
         const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
@@ -1633,12 +1634,12 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
 
         // Filter conditions like v2 does: begin/end must be known ConditionType
         // values (FLURRIES/POSSIBLE_FLURRIES are not in the WK2 schema enum).
-        const conditions = minimal ? [] : (nh.condition || []).filter(c =>
+        const conditions = (windowOnly || minimal) ? [] : (nh.condition || []).filter(c =>
             typeof CONDITION_TYPE[c.beginCondition] === "number" &&
             typeof CONDITION_TYPE[c.endCondition] === "number" &&
             typeof FORECAST_TOKEN[c.forecastToken] === "number");
-        const summaries = minimal ? [] : (nh.summary || []);
-        const minutes = minimal ? [] : nh.minutes;
+        const summaries = (windowOnly || minimal) ? [] : (nh.summary || []);
+        const minutes = (windowOnly || minimal) ? [] : nh.minutes;
         const md = nh.metadata || {};
 
         // BISECT beta3: shift window to now (provider window starts 60-120s in the past)
@@ -1732,17 +1733,27 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         setU32(newRootPos + rootTableSize, nhPos - (newRootPos + rootTableSize));
 
         // ---- NextHour table ----
+        // windowOnly: fields 0/1/2/5 must be ABSENT via vtable entry 0 (a 0 slot
+        // value is not absent in FlatBuffers, it is a self-referential offset).
         setU16(nhVtablePos, 16); setU16(nhVtablePos + 2, 28);
-        setU16(nhVtablePos + 4 + 0 * 2, 24); setU16(nhVtablePos + 4 + 1 * 2, 20);
-        setU16(nhVtablePos + 4 + 2 * 2, 16); setU16(nhVtablePos + 4 + 3 * 2, 12);
-        setU16(nhVtablePos + 4 + 4 * 2, 8); setU16(nhVtablePos + 4 + 5 * 2, 4);
+        if (windowOnly) {
+            setU16(nhVtablePos + 4 + 0 * 2, 0); setU16(nhVtablePos + 4 + 1 * 2, 0);
+            setU16(nhVtablePos + 4 + 2 * 2, 0); setU16(nhVtablePos + 4 + 3 * 2, 12);
+            setU16(nhVtablePos + 4 + 4 * 2, 8); setU16(nhVtablePos + 4 + 5 * 2, 0);
+        } else {
+            setU16(nhVtablePos + 4 + 0 * 2, 24); setU16(nhVtablePos + 4 + 1 * 2, 20);
+            setU16(nhVtablePos + 4 + 2 * 2, 16); setU16(nhVtablePos + 4 + 3 * 2, 12);
+            setU16(nhVtablePos + 4 + 4 * 2, 8); setU16(nhVtablePos + 4 + 5 * 2, 4);
+        }
         setI32(nhPos, nhPos - nhVtablePos);
-        setU32(nhPos + 24, metaPos - (nhPos + 24));
-        setU32(nhPos + 20, condVecPos - (nhPos + 20));
-        setU32(nhPos + 16, summVecPos - (nhPos + 16));
+        if (!windowOnly) {
+            setU32(nhPos + 24, metaPos - (nhPos + 24));
+            setU32(nhPos + 20, condVecPos - (nhPos + 20));
+            setU32(nhPos + 16, summVecPos - (nhPos + 16));
+            setU32(nhPos + 4, minVecPos - (nhPos + 4));
+        }
         setI32(nhPos + 12, Math.trunc(nh.forecastStart || 0));
         setI32(nhPos + 8, Math.trunc(nh.forecastEnd || 0));
-        setU32(nhPos + 4, minVecPos - (nhPos + 4));
 
         // ---- metadata ----
         setU16(metaVtablePos, 26); setU16(metaVtablePos + 2, 44);
@@ -1830,6 +1841,14 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const chkNhOff = chk.__offset(chkRoot, 4 + 5 * 2);
         if (!chkNhOff) return fail("self-check slot 5 absent");
         const chkNh = chk.__indirect(chkRoot + chkNhOff);
+        if (windowOnly) {
+            if (chk.__offset(chkNh, 4) || chk.__offset(chkNh, 6) || chk.__offset(chkNh, 8) || chk.__offset(chkNh, 14)) return fail("self-check windowOnly fields not absent");
+            const chkStartOff = chk.__offset(chkNh, 10);
+            const chkEndOff = chk.__offset(chkNh, 12);
+            if (!chkStartOff || chk.readInt32(chkNh + chkStartOff) !== Math.trunc(nh.forecastStart || 0)) return fail("self-check windowOnly start");
+            if (!chkEndOff || chk.readInt32(chkNh + chkEndOff) !== Math.trunc(nh.forecastEnd || 0)) return fail("self-check windowOnly end");
+            return { body: out, log: `WK3 nhFill: slot 5 created (windowOnly)${opts.shiftToNow ? " (shiftToNow)" : ""} minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}` };
+        }
         const chkNhMetaOff = chk.__offset(chkNh, 4);
         const chkMeta = chk.__indirect(chkNh + chkNhMetaOff);
         const chkProvOff = chk.__offset(chkMeta, 16);
