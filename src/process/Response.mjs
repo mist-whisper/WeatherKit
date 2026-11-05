@@ -148,9 +148,10 @@ export async function Response($request, $response) {
                                     workingBody = alertsReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
-                                // 每日高低温（WK3 v3.4.1-beta1）：只原位改槽 2 每日
-                                // 元素的最高温（字段23）与最低温（字段25）两个
-                                // float32，不动其他字段与昼夜子表；provider 仅彩云
+                                // 每日高低温（WK3 v3.4.1-beta1/beta2）：原位改槽 2
+                                // 每日元素的日级最高温（字段23）与最低温（字段25），
+                                // beta2 起同时改昼夜子表（白天/夜间，字段14/15），
+                                // 因十日 UI 读子表而非日级字段；provider 仅彩云
                                 // （ColorfulClouds.Daily），按 forecastStart 对日匹配，
                                 // 彩云从当日开始供数，苹果向量含昨日，故昨日无匹配
                                 // 时留原值；失败一律原样返回。
@@ -904,19 +905,75 @@ function replaceWK3CWTemperature(ByteBuffer, rawBody, country, providerName, pro
  * 字段身份已由两城独立证实：每日元素字段 23/25 在北京、东京两体
  * 上皆为最高/最低温（与当日最高温比较的当前值比特相等，且最高>
  * 最低在全部 11 日成立）；字段 0 为 forecastStart（当地午夜）。
+ * v3.4.1-beta2 追加：同时改昼夜子表（DayPartForecast）的最高温
+ * （字段14）与最低温（字段15）。原因：beta1 真机闭环证实包体
+ * 已被采用（AQ 卡片显示 EU 的“中等”，非苹果原 HJ 标签），但十
+ * 日预报仍显示苹果值，故十日 UI 不读日级字段 23/25，读的是
+ * 昼夜子表；日级与子表值各自独立（子表按 07:00-19:00 白天与
+ * 19:00-次日 07:00 夜间两个 12 小时窗口算，与日级的日历日窗口
+ * 不同，故值不必相等）。子表按窗口认，不按字段号（日元素字段
+ * 数因“今日”多一张当日余段表而在 34/35 间变）：白天子表起止
+ * 为日起 +7h/+19h，夜间为 +19h/+31h，时长皆 12h；当日余段表
+ * （起于请求时刻、止于午夜）时长非 12h，天然排除。
  * provider 仅彩云（ColorfulClouds.Daily）：按 forecastStart 对日
  * 匹配，不按下标——彩云每日从当日开始供数（实测 begin 参数被忽
  * 略），而苹果向量元素 0 为昨日，故昨日无匹配时留原值；彩云缺
  * 某日或某日高低温非有限数时该日留原值。任一校验失败都原样返回
  * （body 为 null）。
- * 自检：用新包体重建 ByteBuffer，重新走槽 2 向量与各元素 vtable，
- * 核对每个已换浮点与 provider 值（float32 舍入后）一致。
+ * 自检：用新包体重建 ByteBuffer，重新走槽 2 向量与各元素 vtable
+ * 及昼夜子表，核对每个已换浮点与 provider 值（float32 舍入后）一致。
  * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
  * @param {Uint8Array} rawBody - 原始包体（不原地修改，成功时返回新拷贝）
  * @param {any} parameters - parseWeatherKitURL 的结果（含 country / 经纬度）
  * @param {any} Settings - 插件 Settings
  * @returns {{body: Uint8Array | null, log: string}}
  */
+/**
+ * 在一个 WK3 每日元素内按窗口找出昼夜子表（DayPartForecast）。
+ * 不按字段号（日元素字段数在 34/35 间变）：白天子表起于日起 +7h、
+ * 夜间起于 +19h，时长皆约 12h；当日余段表（起于请求时刻）时长
+ * 非 12h，天然排除。返回 { daytime, overnight }，各为
+ * { tablePos, maxPos, minPos } 或 null（字段 14/15 为最高/最低温）。
+ */
+function findWK3Dayparts(ByteBuffer, rawLength, elemPos, dayStart) {
+    const vtablePos = elemPos - ByteBuffer.readInt32(elemPos);
+    const fieldCount = Math.floor((ByteBuffer.readUint16(vtablePos) - 4) / 2);
+    const out = { daytime: null, overnight: null };
+    for (let f = 0; f < fieldCount; f++) {
+        const off = ByteBuffer.__offset(elemPos, 4 + f * 2);
+        if (!off) continue;
+        const pos = elemPos + off;
+        const v = ByteBuffer.readInt32(pos);
+        if (v <= 0 || pos + v >= rawLength) continue;
+        const tablePos = pos + v;
+        let subVtable;
+        try {
+            subVtable = tablePos - ByteBuffer.readInt32(tablePos);
+            const subCount = Math.floor((ByteBuffer.readUint16(subVtable) - 4) / 2);
+            if (subCount < 20 || subCount > 32) continue;
+        } catch {
+            continue;
+        }
+        const startOff = ByteBuffer.__offset(tablePos, 4);
+        const endOff = ByteBuffer.__offset(tablePos, 6);
+        const maxOff = ByteBuffer.__offset(tablePos, 32);
+        const minOff = ByteBuffer.__offset(tablePos, 34);
+        if (!startOff || !endOff || !maxOff || !minOff) continue;
+        const start = ByteBuffer.readInt32(tablePos + startOff);
+        const end = ByteBuffer.readInt32(tablePos + endOff);
+        const durH = (end - start) / 3600;
+        const startH = (start - dayStart) / 3600;
+        if (durH < 11 || durH > 13) continue;
+        const max = ByteBuffer.readFloat32(tablePos + maxOff);
+        const min = ByteBuffer.readFloat32(tablePos + minOff);
+        if (!Number.isFinite(max) || !Number.isFinite(min) || max < -60 || max > 60 || min < -60 || min > 60) continue;
+        const part = { tablePos, maxPos: tablePos + maxOff, minPos: tablePos + minOff };
+        if (startH >= 5 && startH <= 9 && !out.daytime) out.daytime = part;
+        else if (startH >= 17 && startH <= 21 && !out.overnight) out.overnight = part;
+    }
+    return out;
+}
+
 async function replaceWK3DailyHighLow(ByteBuffer, rawBody, parameters, Settings) {
     try {
         if (!Settings?.Weather?.Replace?.includes(parameters.country)) {
@@ -966,6 +1023,7 @@ async function replaceWK3DailyHighLow(ByteBuffer, rawBody, parameters, Settings)
         const modified = new Uint8Array(rawBody);
         const view = new DataView(modified.buffer, modified.byteOffset, modified.byteLength);
         let replaced = 0;
+        let replacedParts = 0;
         let firstLog = "";
         for (const day of days) {
             const pd = byStart.get(day.forecastStart);
@@ -974,6 +1032,19 @@ async function replaceWK3DailyHighLow(ByteBuffer, rawBody, parameters, Settings)
             view.setFloat32(day.minPos, pd.temperatureMin, true);
             replaced++;
             if (!firstLog) firstLog = `day ${day.forecastStart} max ${day.oldMax.toFixed(2)}->${pd.temperatureMax.toFixed(2)} min ${day.oldMin.toFixed(2)}->${pd.temperatureMin.toFixed(2)}`;
+            const parts = findWK3Dayparts(ByteBuffer, rawBody.length, day.elemPos, day.forecastStart);
+            const dayPart = pd.daytimeForecast;
+            const nightPart = pd.overnightForecast;
+            if (parts.daytime && dayPart && Number.isFinite(dayPart.temperatureMax) && Number.isFinite(dayPart.temperatureMin)) {
+                view.setFloat32(parts.daytime.maxPos, dayPart.temperatureMax, true);
+                view.setFloat32(parts.daytime.minPos, dayPart.temperatureMin, true);
+                replacedParts++;
+            }
+            if (parts.overnight && nightPart && Number.isFinite(nightPart.temperatureMax) && Number.isFinite(nightPart.temperatureMin)) {
+                view.setFloat32(parts.overnight.maxPos, nightPart.temperatureMax, true);
+                view.setFloat32(parts.overnight.minPos, nightPart.temperatureMin, true);
+                replacedParts++;
+            }
         }
         if (replaced === 0) return { body: null, log: "WK3 daily: skipped (no day matched)" };
         const checkBb = new flatbuffers.ByteBuffer(modified);
@@ -996,8 +1067,23 @@ async function replaceWK3DailyHighLow(ByteBuffer, rawBody, parameters, Settings)
                 checkBb.readFloat32(elemPos + minOffset) !== Math.fround(pd.temperatureMin)) {
                 return { body: null, log: "WK3 daily: skipped (self-check: value mismatch)" };
             }
+            const parts = findWK3Dayparts(checkBb, modified.length, elemPos, checkBb.readInt32(elemPos + startOffset));
+            const dayPart = pd.daytimeForecast;
+            const nightPart = pd.overnightForecast;
+            if (parts.daytime && dayPart && Number.isFinite(dayPart.temperatureMax) && Number.isFinite(dayPart.temperatureMin)) {
+                if (checkBb.readFloat32(parts.daytime.maxPos) !== Math.fround(dayPart.temperatureMax) ||
+                    checkBb.readFloat32(parts.daytime.minPos) !== Math.fround(dayPart.temperatureMin)) {
+                    return { body: null, log: "WK3 daily: skipped (self-check: daytime value mismatch)" };
+                }
+            }
+            if (parts.overnight && nightPart && Number.isFinite(nightPart.temperatureMax) && Number.isFinite(nightPart.temperatureMin)) {
+                if (checkBb.readFloat32(parts.overnight.maxPos) !== Math.fround(nightPart.temperatureMax) ||
+                    checkBb.readFloat32(parts.overnight.minPos) !== Math.fround(nightPart.temperatureMin)) {
+                    return { body: null, log: "WK3 daily: skipped (self-check: overnight value mismatch)" };
+                }
+            }
         }
-        return { body: modified, log: `WK3 daily: ColorfulClouds ${replaced}/${days.length} days high/low replaced (${firstLog})` };
+        return { body: modified, log: `WK3 daily: ColorfulClouds ${replaced}/${days.length} days high/low replaced (${firstLog}) [dayparts ${replacedParts}]` };
     } catch (error) {
         return { body: null, log: `WK3 daily: skipped (${error?.message ?? error})` };
     }
