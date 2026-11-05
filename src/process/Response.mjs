@@ -160,6 +160,16 @@ export async function Response($request, $response) {
                                     workingBody = dailyReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
+                                // 逐小时温度（WK3 v3.4.1-beta3）：只原位改槽 3 小时
+                                // 元素的温度（字段17）一个 float32，不动其他字段；
+                                // provider 仅彩云（ColorfulClouds.ForecastHourly），
+                                // 按 forecastStart 对时匹配，过去小时无匹配时留原值；
+                                // 失败一律原样返回。
+                                const hourlyReplace = await replaceWK3HourlyTemperature(workingByteBuffer, workingBody, parameters, Settings);
+                                if (hourlyReplace.body) {
+                                    workingBody = hourlyReplace.body;
+                                    workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
+                                }
                                 // 未来一小时填空（WK3）：beta6 已证实，任何新建槽 5
                                 // 的体（填空/最小/窗口-only/东京原表移植）都会被 App
                                 // 整包丢弃（槽位存在本身即缺陷），故 beta7 起停用
@@ -183,6 +193,7 @@ export async function Response($request, $response) {
                                     cwReplace.log,
                                     alertsReplace.log,
                                     dailyReplace.log,
+                                    hourlyReplace.log,
                                     nhReplace.log,
                                 );
                                 break;
@@ -1086,6 +1097,106 @@ async function replaceWK3DailyHighLow(ByteBuffer, rawBody, parameters, Settings)
         return { body: modified, log: `WK3 daily: ColorfulClouds ${replaced}/${days.length} days high/low replaced (${firstLog}) [dayparts ${replacedParts}]` };
     } catch (error) {
         return { body: null, log: `WK3 daily: skipped (${error?.message ?? error})` };
+    }
+}
+
+/**
+ * WK3 逐小时温度原位替换（v3.4.1-beta3）：只改槽 3 小时元素的
+ * 温度（字段17）一个 float32，不动其他字段，不改包体长度与
+ * 任何偏移。字段身份已由三城证实：小时元素字段 17 在北京、
+ * 东京、哈尔滨三体上皆为温度（与 CW 温度/体感/露点三重贴
+ * 近，哈尔滨体感精确相等，全日曲线平滑）；字段 0 为
+ * forecastStart（整点）。WK2 的 26 字段中仅 19 号 unknown20
+ * 被删，自 20 起差一位，温度字段号未变。
+ * provider 仅彩云（ColorfulClouds.ForecastHourly）：按
+ * forecastStart 对时匹配，不按下标——彩云逐小时从当前小时
+ * 开始供数（实测 begin 参数未必生效），而苹果向量含过去数
+ * 日小时，故过去小时无匹配时留原值；彩云缺某小时或某小时
+ * 温度非有限数时该小时留原值。任一校验失败都原样返回
+ * （body 为 null）。
+ * 自检：用新包体重建 ByteBuffer，重新走槽 3 向量与各元素
+ * vtable，核对每个已换浮点与 provider 值（float32 舍入后）一致。
+ * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
+ * @param {Uint8Array} rawBody - 原始包体（不原地修改，成功时返回新拷贝）
+ * @param {any} parameters - parseWeatherKitURL 的结果（含 country / 经纬度）
+ * @param {any} Settings - 插件 Settings
+ * @returns {{body: Uint8Array | null, log: string}}
+ */
+async function replaceWK3HourlyTemperature(ByteBuffer, rawBody, parameters, Settings) {
+    try {
+        if (!Settings?.Weather?.Replace?.includes(parameters?.country)) return { body: null, log: `WK3 hourly: skipped (country ${parameters?.country} not in Weather.Replace)` };
+        if (Settings?.Weather?.Provider !== "ColorfulClouds") return { body: null, log: `WK3 hourly: skipped (provider ${Settings?.Weather?.Provider} not wired in WK3)` };
+        const rootPos = ByteBuffer.position() + ByteBuffer.readInt32(ByteBuffer.position());
+        const rootVtable = rootPos - ByteBuffer.readInt32(rootPos);
+        const rootFieldCount = Math.floor((ByteBuffer.readUint16(rootVtable) - 4) / 2);
+        if (rootFieldCount <= 3) return { body: null, log: "WK3 hourly: skipped (slot 3 absent or empty root)" };
+        const slot3Offset = ByteBuffer.__offset(rootPos, 10);
+        if (!slot3Offset) return { body: null, log: "WK3 hourly: skipped (slot 3 absent)" };
+        const wrapperPos = ByteBuffer.__indirect(rootPos + slot3Offset);
+        const hoursVecOffset = ByteBuffer.__offset(wrapperPos, 6);
+        if (!hoursVecOffset) return { body: null, log: "WK3 hourly: skipped (hours vector absent)" };
+        const hoursVec = ByteBuffer.__indirect(wrapperPos + hoursVecOffset);
+        const hourCount = ByteBuffer.readInt32(hoursVec);
+        if (hourCount < 1 || hourCount > 400) return { body: null, log: `WK3 hourly: skipped (unexpected hour count ${hourCount})` };
+        const hours = [];
+        for (let i = 0; i < hourCount; i++) {
+            const slotPos = hoursVec + 4 + i * 4;
+            const elemPos = slotPos + ByteBuffer.readInt32(slotPos);
+            const startOffset = ByteBuffer.__offset(elemPos, 4);
+            const tempOffset = ByteBuffer.__offset(elemPos, 38);
+            if (!startOffset || !tempOffset) continue;
+            hours.push({
+                elemPos,
+                forecastStart: ByteBuffer.readInt32(elemPos + startOffset),
+                oldTemp: ByteBuffer.readFloat32(elemPos + tempOffset),
+                tempPos: elemPos + tempOffset,
+            });
+        }
+        if (hours.length === 0) return { body: null, log: "WK3 hourly: skipped (no decodable hour element)" };
+        const provider = new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ==");
+        const providerHourly = await provider.ForecastHourly(hours.length, hours[0].forecastStart);
+        const providerHours = Array.isArray(providerHourly?.hours) ? providerHourly.hours : [];
+        if (providerHours.length === 0) return { body: null, log: "WK3 hourly: skipped (ColorfulClouds hourly unavailable)" };
+        const byStart = new Map();
+        for (const h of providerHours) {
+            if (Number.isFinite(h?.forecastStart) && Number.isFinite(h?.temperature)) byStart.set(h.forecastStart, h.temperature);
+        }
+        const modified = new Uint8Array(rawBody);
+        const view = new DataView(modified.buffer, modified.byteOffset, modified.byteLength);
+        let replaced = 0;
+        let firstLog = "";
+        for (const hour of hours) {
+            const temp = byStart.get(hour.forecastStart);
+            if (temp === undefined) continue;
+            view.setFloat32(hour.tempPos, temp, true);
+            replaced++;
+            if (!firstLog) firstLog = `hour ${hour.forecastStart} temp ${hour.oldTemp.toFixed(2)}->${temp.toFixed(2)}`;
+        }
+        if (replaced === 0) return { body: null, log: "WK3 hourly: skipped (no hour matched)" };
+        const checkBb = new flatbuffers.ByteBuffer(modified);
+        const checkRoot = checkBb.position() + checkBb.readInt32(checkBb.position());
+        const checkSlot3 = checkBb.__offset(checkRoot, 10);
+        if (!checkSlot3) return { body: null, log: "WK3 hourly: skipped (self-check: slot 3 lost)" };
+        const checkWrapper = checkBb.__indirect(checkRoot + checkSlot3);
+        const checkVecOff = checkBb.__offset(checkWrapper, 6);
+        if (!checkVecOff) return { body: null, log: "WK3 hourly: skipped (self-check: hours vector lost)" };
+        const checkVec = checkBb.__indirect(checkWrapper + checkVecOff);
+        if (checkBb.readInt32(checkVec) !== hourCount) return { body: null, log: "WK3 hourly: skipped (self-check: hour count changed)" };
+        for (let i = 0; i < hourCount; i++) {
+            const slotPos = checkVec + 4 + i * 4;
+            const elemPos = slotPos + checkBb.readInt32(slotPos);
+            const startOffset = checkBb.__offset(elemPos, 4);
+            const tempOffset = checkBb.__offset(elemPos, 38);
+            if (!startOffset || !tempOffset) continue;
+            const temp = byStart.get(checkBb.readInt32(elemPos + startOffset));
+            if (temp === undefined) continue;
+            if (checkBb.readFloat32(elemPos + tempOffset) !== Math.fround(temp)) {
+                return { body: null, log: "WK3 hourly: skipped (self-check: value mismatch)" };
+            }
+        }
+        return { body: modified, log: `WK3 hourly: ColorfulClouds ${replaced}/${hours.length} hours temperature replaced (${firstLog})` };
+    } catch (error) {
+        return { body: null, log: `WK3 hourly: skipped (${error?.message ?? error})` };
     }
 }
 
