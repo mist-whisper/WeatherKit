@@ -148,6 +148,17 @@ export async function Response($request, $response) {
                                     workingBody = alertsReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
+                                // 每日高低温（WK3 v3.4.1-beta1）：只原位改槽 2 每日
+                                // 元素的最高温（字段23）与最低温（字段25）两个
+                                // float32，不动其他字段与昼夜子表；provider 仅彩云
+                                // （ColorfulClouds.Daily），按 forecastStart 对日匹配，
+                                // 彩云从当日开始供数，苹果向量含昨日，故昨日无匹配
+                                // 时留原值；失败一律原样返回。
+                                const dailyReplace = await replaceWK3DailyHighLow(workingByteBuffer, workingBody, parameters, Settings);
+                                if (dailyReplace.body) {
+                                    workingBody = dailyReplace.body;
+                                    workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
+                                }
                                 // 未来一小时填空（WK3）：beta6 已证实，任何新建槽 5
                                 // 的体（填空/最小/窗口-only/东京原表移植）都会被 App
                                 // 整包丢弃（槽位存在本身即缺陷），故 beta7 起停用
@@ -170,6 +181,7 @@ export async function Response($request, $response) {
                                     aqReplace.log,
                                     cwReplace.log,
                                     alertsReplace.log,
+                                    dailyReplace.log,
                                     nhReplace.log,
                                 );
                                 break;
@@ -882,6 +894,112 @@ function replaceWK3CWTemperature(ByteBuffer, rawBody, country, providerName, pro
         return { body: modified, log: `WK3 cwReplace: provider ${providerName} temp ${oldTemp.toFixed(2)}->${newTemp.toFixed(2)} apparent ${oldApparent.toFixed(2)}->${newApparent.toFixed(2)} dew ${oldDew.toFixed(2)}->${newDew.toFixed(2)} (${dewSource}) humidity ${humidity}` };
     } catch (error) {
         return { body: null, log: `WK3 cwReplace: skipped (${error?.message ?? error})` };
+    }
+}
+
+/**
+ * WK3 每日高低温原位替换（v3.4.1-beta1）：只改槽 2 每日元素的
+ * 最高温（字段23）与最低温（字段25）两个 float32，不动其他字段
+ * 与昼夜子表，不改包体长度与任何偏移。
+ * 字段身份已由两城独立证实：每日元素字段 23/25 在北京、东京两体
+ * 上皆为最高/最低温（与当日最高温比较的当前值比特相等，且最高>
+ * 最低在全部 11 日成立）；字段 0 为 forecastStart（当地午夜）。
+ * provider 仅彩云（ColorfulClouds.Daily）：按 forecastStart 对日
+ * 匹配，不按下标——彩云每日从当日开始供数（实测 begin 参数被忽
+ * 略），而苹果向量元素 0 为昨日，故昨日无匹配时留原值；彩云缺
+ * 某日或某日高低温非有限数时该日留原值。任一校验失败都原样返回
+ * （body 为 null）。
+ * 自检：用新包体重建 ByteBuffer，重新走槽 2 向量与各元素 vtable，
+ * 核对每个已换浮点与 provider 值（float32 舍入后）一致。
+ * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
+ * @param {Uint8Array} rawBody - 原始包体（不原地修改，成功时返回新拷贝）
+ * @param {any} parameters - parseWeatherKitURL 的结果（含 country / 经纬度）
+ * @param {any} Settings - 插件 Settings
+ * @returns {{body: Uint8Array | null, log: string}}
+ */
+async function replaceWK3DailyHighLow(ByteBuffer, rawBody, parameters, Settings) {
+    try {
+        if (!Settings?.Weather?.Replace?.includes(parameters.country)) {
+            return { body: null, log: `WK3 daily: skipped (country ${parameters.country} not in Weather.Replace)` };
+        }
+        if (Settings?.Weather?.Provider !== "ColorfulClouds") {
+            return { body: null, log: `WK3 daily: skipped (provider ${Settings?.Weather?.Provider ?? "?"} not wired in WK3)` };
+        }
+        const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
+        const vtablePos = rootPos - ByteBuffer.readInt32(rootPos);
+        const fieldCount = Math.floor((ByteBuffer.readUint16(vtablePos) - 4) / 2);
+        if (fieldCount <= 2) return { body: null, log: "WK3 daily: skipped (slot 2 absent or empty root)" };
+        const slot2Offset = ByteBuffer.__offset(rootPos, 8);
+        if (!slot2Offset) return { body: null, log: "WK3 daily: skipped (slot 2 absent)" };
+        const wrapperPos = ByteBuffer.__indirect(rootPos + slot2Offset);
+        const vecOffset = ByteBuffer.__offset(wrapperPos, 6);
+        if (!vecOffset) return { body: null, log: "WK3 daily: skipped (daily vector absent)" };
+        const vecPos = ByteBuffer.__indirect(wrapperPos + vecOffset);
+        const dayCount = ByteBuffer.readInt32(vecPos);
+        if (dayCount <= 0 || dayCount > 32) return { body: null, log: `WK3 daily: skipped (unexpected daily vector length ${dayCount})` };
+        const days = [];
+        for (let i = 0; i < dayCount; i++) {
+            const slotPos = vecPos + 4 + i * 4;
+            const elemPos = slotPos + ByteBuffer.readInt32(slotPos);
+            const startOffset = ByteBuffer.__offset(elemPos, 4);
+            const maxOffset = ByteBuffer.__offset(elemPos, 50);
+            const minOffset = ByteBuffer.__offset(elemPos, 54);
+            if (!startOffset || !maxOffset || !minOffset) continue;
+            days.push({
+                elemPos,
+                forecastStart: ByteBuffer.readInt32(elemPos + startOffset),
+                maxPos: elemPos + maxOffset,
+                minPos: elemPos + minOffset,
+                oldMax: ByteBuffer.readFloat32(elemPos + maxOffset),
+                oldMin: ByteBuffer.readFloat32(elemPos + minOffset),
+            });
+        }
+        if (days.length === 0) return { body: null, log: "WK3 daily: skipped (no decodable day element)" };
+        const colorfulClouds = new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ==");
+        let providerDaily;
+        try {
+            providerDaily = await colorfulClouds.Daily(dayCount, days[0].forecastStart);
+        } catch (error) {
+            return { body: null, log: `WK3 daily: skipped (provider error: ${error?.message ?? error})` };
+        }
+        const byStart = new Map((providerDaily?.days ?? []).map(d => [d.forecastStart, d]));
+        const modified = new Uint8Array(rawBody);
+        const view = new DataView(modified.buffer, modified.byteOffset, modified.byteLength);
+        let replaced = 0;
+        let firstLog = "";
+        for (const day of days) {
+            const pd = byStart.get(day.forecastStart);
+            if (!pd || !Number.isFinite(pd.temperatureMax) || !Number.isFinite(pd.temperatureMin)) continue;
+            view.setFloat32(day.maxPos, pd.temperatureMax, true);
+            view.setFloat32(day.minPos, pd.temperatureMin, true);
+            replaced++;
+            if (!firstLog) firstLog = `day ${day.forecastStart} max ${day.oldMax.toFixed(2)}->${pd.temperatureMax.toFixed(2)} min ${day.oldMin.toFixed(2)}->${pd.temperatureMin.toFixed(2)}`;
+        }
+        if (replaced === 0) return { body: null, log: "WK3 daily: skipped (no day matched)" };
+        const checkBb = new flatbuffers.ByteBuffer(modified);
+        const checkRoot = checkBb.readInt32(checkBb.position()) + checkBb.position();
+        const checkSlot2 = checkBb.__offset(checkRoot, 8);
+        if (!checkSlot2) return { body: null, log: "WK3 daily: skipped (self-check: slot 2 lost)" };
+        const checkWrapper = checkBb.__indirect(checkRoot + checkSlot2);
+        const checkVec = checkBb.__indirect(checkWrapper + checkBb.__offset(checkWrapper, 6));
+        if (checkBb.readInt32(checkVec) !== dayCount) return { body: null, log: "WK3 daily: skipped (self-check: day count changed)" };
+        for (let i = 0; i < dayCount; i++) {
+            const slotPos = checkVec + 4 + i * 4;
+            const elemPos = slotPos + checkBb.readInt32(slotPos);
+            const startOffset = checkBb.__offset(elemPos, 4);
+            const maxOffset = checkBb.__offset(elemPos, 50);
+            const minOffset = checkBb.__offset(elemPos, 54);
+            if (!startOffset || !maxOffset || !minOffset) continue;
+            const pd = byStart.get(checkBb.readInt32(elemPos + startOffset));
+            if (!pd || !Number.isFinite(pd.temperatureMax) || !Number.isFinite(pd.temperatureMin)) continue;
+            if (checkBb.readFloat32(elemPos + maxOffset) !== Math.fround(pd.temperatureMax) ||
+                checkBb.readFloat32(elemPos + minOffset) !== Math.fround(pd.temperatureMin)) {
+                return { body: null, log: "WK3 daily: skipped (self-check: value mismatch)" };
+            }
+        }
+        return { body: modified, log: `WK3 daily: ColorfulClouds ${replaced}/${days.length} days high/low replaced (${firstLog})` };
+    } catch (error) {
+        return { body: null, log: `WK3 daily: skipped (${error?.message ?? error})` };
     }
 }
 
