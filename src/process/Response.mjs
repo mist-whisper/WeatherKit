@@ -402,7 +402,11 @@ async function calculateWK3AQ(ByteBuffer, rawBody, country, Settings, aqEnv = nu
         if (vecPos < 0 || vecPos + 4 > rawBody.length) return { body: null, log: "WK3 aq: skipped (pollutants vector out of range)" };
         const vecLen = ByteBuffer.readInt32(vecPos);
         if (vecLen > 20) return { body: null, log: `WK3 aq: skipped (pollutants too many: ${vecLen})` };
-        const pollutantTypes = ["NOT_AVAILABLE", "C6H6", "NH3", "NMHC", "NO", "NO2", "NOX", "OZONE", "PM2_5", "SO2", "PM10", "CO", "UNKNOWN12", "UNKNOWN13"];
+        // WK3 污染物类型枚举相对 WK2 数组整体错位一位（离线对照 ANALYSIS §174：
+        // 以苹果指数为标尺，7 城拟合误差 0.1–3.6，插件标签误差 13–97）。
+        // 真值 = 数组[typeByte - 1]，故头部补一位占位；WK3 的 0 号类型未知。
+        // 影响：Calculate 指数/档位/主污染物、向量重建的槽位匹配、明细页数值。
+        const pollutantTypes = ["UNKNOWN0", "NOT_AVAILABLE", "C6H6", "NH3", "NMHC", "NO", "NO2", "NOX", "OZONE", "PM2_5", "SO2", "PM10", "CO", "UNKNOWN12", "UNKNOWN13"];
         // WK2 的单位枚举：0 ppb、1 µg、2 UNKNOWN2、3 UNKNOWN3。WK3 原包体里
         // 大量出现单位字节 2，且浓度是 µg 量级，故计算时把它当作微克（推断，见函数注释）。
         const unitTypes = ["PARTS_PER_BILLION", "MICROGRAMS_PER_CUBIC_METER", "MICROGRAMS_PER_CUBIC_METER", "UNKNOWN3"];
