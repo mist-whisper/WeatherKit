@@ -179,14 +179,34 @@ export async function Response($request, $response) {
                                     workingBody = hourlyReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
-                                // 未来一小时填空（WK3）：beta6 已证实，任何新建槽 5
-                                // 的体（填空/最小/窗口-only/东京原表移植）都会被 App
-                                // 整包丢弃（槽位存在本身即缺陷），故 beta7 起停用
-                                // 移植，槽 5 保持原样缺席，以免遮住预警补充的结果。
-                                // transplantWK3NextHour 与 fillWK3NextHour 保留在文件
-                                // 里备查，本 beta 不调用。
-                                const nhDefaultLog = "WK3 nh: skipped (transplant parked, slot-presence defect)";
-                                let nhReplace = { body: null, log: nhDefaultLog };
+                                // 未来一小时填空（WK3 3.4.1-beta8）：按 PR #108 规格重建槽 5
+                                // （§183：beta1–b6 的 writer 照 WK2 形状写，摘要 condition 应为
+                                // 字节向量、枚举应为 1 起值；“存在性即缺陷”是过度概括）。
+                                // 只在 forecastNextHour 在 dataSets 且国家在 Replace 时跑；
+                                // provider 默认彩云（InjectForecastNextHour 默认分支），
+                                // 窗口移至今；任一失败原样返回，不影响其他槽。
+                                // transplantWK3NextHour 仍停用、保留在文件里备查。
+                                let nhReplace = { body: null, log: "WK3 nh: skipped (not attempted)" };
+                                if (parameters.dataSets.includes("forecastNextHour") && Settings?.Weather?.Replace?.includes(parameters.country)) {
+                                    try {
+                                        const nhEnv = {
+                                            colorfulClouds: new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ=="),
+                                            qWeather: new QWeather({ ...parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host),
+                                        };
+                                        const nhData = await InjectForecastNextHour(undefined, Settings, nhEnv);
+                                        if (nhData) {
+                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { shiftToNow: true });
+                                            if (nhReplace.body) {
+                                                workingBody = nhReplace.body;
+                                                workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
+                                            }
+                                        } else {
+                                            nhReplace = { body: null, log: "WK3 nh: skipped (no provider data)" };
+                                        }
+                                    } catch (e) {
+                                        nhReplace = { body: null, log: `WK3 nh: skipped (exception ${e?.message ?? e})` };
+                                    }
+                                }
                                 rawBody = workingBody;
                                 Console.warn(
                                     "WK3 weather response (experiment, not a fix) [cwReplace: CW real provider temperature, all other bytes unchanged, fail -> original]",
@@ -2674,14 +2694,14 @@ async function InjectComparison(airQuality, currentIndexProvider, Settings, Cach
 // Layout rule (beta10 lesson): every vector precedes its element tables;
 // all element uoffsets are forward (small positive).
 
-const CONDITION_TYPE = {
-    CLEAR: 0, SLEET: 3, POSSIBLE_SLEET: 4, HEAVY_RAIN: 5, RAIN: 6,
-    DRIZZLE: 7, POSSIBLE_DRIZZLE: 8, HEAVY_SNOW: 9, SNOW: 10,
-};
-const FORECAST_TOKEN = { CLEAR: 0, START: 1, STOP: 2, START_STOP: 3, STOP_START: 4, CONSTANT: 5 };
-const PRECIPITATION_TYPE = { CLEAR: 0, RAIN: 1, SNOW: 2, SLEET: 3, HAIL: 4, MIXED: 6 };
-const PARAMETER_TYPE = { FIRST_AT: 0, SECOND_AT: 1 };
-const SOURCE_TYPE = { APPLE_INTERNAL: 0, MODELED: 1, STATION: 2 };
+// WK3 NextHour 枚举（3.4.1-beta8）：PR #108 配对样本值，1 起值；与 WK2 的 0 起值表
+// 不同，不可混用（beta7 的 AQ 污染物错位即同类问题）。condition 只认 CLEAR/RAIN/
+// DRIZZLE，precipitation 只认 CLEAR/RAIN，token 无 STOP_START。
+const WK3_NH_CONDITION = { CLEAR: 1, RAIN: 7, DRIZZLE: 8 };
+const WK3_NH_TOKEN = { CLEAR: 1, START: 2, STOP: 3, START_STOP: 4, CONSTANT: 6 };
+const WK3_NH_PRECIPITATION = { CLEAR: 1, RAIN: 2 };
+const WK3_NH_PARAMETER = { FIRST_AT: 1, SECOND_AT: 2 };
+const WK3_NH_SOURCE = { MODELED: 2, STATION: 3 };
 
 
 // 东京原表移植探针（beta6）：把 Capture 304 东京原体里的槽 5 子图
@@ -2883,12 +2903,20 @@ function transplantWK3NextHour(ByteBuffer, rawBody) {
     }
 }
 
+// ---- WK3 NextHour fill (3.4.1-beta8): rebuild slot 5 per PR #108 spec ----
+// PR #108 (patrickyanxxxxx) paired Apple v3 JSON + WK3 FlatBuffer samples:
+// slot 5 = 6 fields [metadata, condition[], summary[], forecastStart, forecastEnd, minutes[]];
+// minute 4 fields (startTime u32, chance u8, intensity f32, perceived f32);
+// summary 5 fields (startTime, endTime, condition BYTE VECTOR, chance u8, intensity f32);
+// condition 6 fields (startTime, endTime, token u8, begin u8, end u8, parameters[]);
+// parameter 2 fields (type u8, date u32). Enums are 1-based (WK3_NH_* tables).
+// beta1–beta6 defects fixed here (§183): summary.condition was a scalar i8 (must be a
+// byte vector); all enums used WK2 0-based values; timeline invariants were not enforced.
+// Fail closed on any unknown enum / broken timeline / multi-condition summary.
 function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
-    const minimal = !!opts.minimal; // BISECT beta2: minimal slot 5 (metadata only, empty vectors)
-    const windowOnly = !!opts.windowOnly; // BISECT beta5: window-only slot 5 (no metadata, no vectors)
     const fail = log => ({ body: null, log: `WK3 nhFill: skipped (${log})` });
     try {
-        if (!nh || !Array.isArray(nh.minutes) || (nh.minutes.length === 0 && !minimal && !windowOnly)) return fail("no minutes");
+        if (!nh || !Array.isArray(nh.minutes) || nh.minutes.length === 0) return fail("no minutes");
         const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
         if (rootPos < 0 || rootPos + 4 > rawBody.length) return fail("root out of range");
         const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
@@ -2899,37 +2927,100 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             return fail(`unexpected root fields=${rootFieldCount} size=${rootTableSize}`);
         }
         if (ByteBuffer.__offset(rootPos, 4 + 5 * 2)) return fail("slot 5 present");
-        const presentSlots = [];
-        for (let slot = 0; slot < rootFieldCount; slot++) {
-            if (ByteBuffer.__offset(rootPos, 4 + slot * 2)) presentSlots.push(slot);
-        }
-
-        // Filter conditions like v2 does: begin/end must be known ConditionType
-        // values (FLURRIES/POSSIBLE_FLURRIES are not in the WK2 schema enum).
-        const conditions = (windowOnly || minimal) ? [] : (nh.condition || []).filter(c =>
-            typeof CONDITION_TYPE[c.beginCondition] === "number" &&
-            typeof CONDITION_TYPE[c.endCondition] === "number" &&
-            typeof FORECAST_TOKEN[c.forecastToken] === "number");
-        const summaries = (windowOnly || minimal) ? [] : (nh.summary || []);
-        const minutes = (windowOnly || minimal) ? [] : nh.minutes;
         const md = nh.metadata || {};
-
-        // BISECT beta3: shift window to now (provider window starts 60-120s in the past)
-        if (opts.shiftToNow) {
-            const nowSec = Math.trunc(Date.now() / 1000);
-            const delta = nowSec - Math.trunc(nh.forecastStart || 0);
-            if (delta > 0) {
-                nh.forecastStart = Math.trunc(nh.forecastStart || 0) + delta;
-                nh.forecastEnd = Math.trunc(nh.forecastEnd || 0) + delta;
-                for (const m of minutes) m.startTime = Math.trunc(m.startTime || 0) + delta;
-                for (const s of summaries) { s.startTime = Math.trunc(s.startTime || 0) + delta; if (s.endTime) s.endTime = Math.trunc(s.endTime) + delta; }
-                for (const c of conditions) { c.startTime = Math.trunc(c.startTime || 0) + delta; if (c.endTime) c.endTime = Math.trunc(c.endTime) + delta; for (const p of (c.parameters || [])) p.date = Math.trunc(p.date || 0) + delta; }
+        // Request coordinates: provider metadata first (CC body.location /
+        // QWeather request coords), else the target body's slot-0 AQ metadata.
+        let metaLat = Number.isFinite(md.latitude) ? md.latitude : null;
+        let metaLon = Number.isFinite(md.longitude) ? md.longitude : null;
+        if (metaLat === null || metaLon === null) {
+            const slot0Off = ByteBuffer.__offset(rootPos, 4 + 0 * 2);
+            if (slot0Off) {
+                const aqTable = ByteBuffer.__indirect(rootPos + slot0Off);
+                const aqMetaOff = ByteBuffer.__offset(aqTable, 4 + 0 * 2);
+                if (aqMetaOff) {
+                    const aqMeta = ByteBuffer.__indirect(aqTable + aqMetaOff);
+                    const latOff = ByteBuffer.__offset(aqMeta, 4 + 3 * 2);
+                    const lonOff = ByteBuffer.__offset(aqMeta, 4 + 4 * 2);
+                    if (latOff && lonOff) {
+                        const dv = new DataView(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength);
+                        const la = dv.getFloat32(aqMeta + latOff, true);
+                        const lo = dv.getFloat32(aqMeta + lonOff, true);
+                        if (Number.isFinite(la) && Number.isFinite(lo)) {
+                            if (metaLat === null) metaLat = la;
+                            if (metaLon === null) metaLon = lo;
+                        }
+                    }
+                }
             }
         }
-
+        if (metaLat === null || metaLon === null) return fail("no coordinates for metadata");
+        // sourceType: WK3 1-based; unknown -> fail (PR: explicit attestation).
+        const sourceType = WK3_NH_SOURCE[md.sourceType];
+        if (typeof sourceType !== "number") return fail(`sourceType unsupported: ${md.sourceType}`);
+        // ---- normalize + validate (PR timeline invariants, fail closed) ----
+        const start0 = Math.trunc(nh.forecastStart || 0);
+        if (!start0) return fail("no forecastStart");
+        let delta = 0;
+        if (opts.shiftToNow) {
+            const nowSec = Math.trunc(Date.now() / 1000);
+            delta = (nowSec - (nowSec % 60)) - start0;
+        }
+        const shift = t => Math.trunc(t || 0) + delta;
+        const minutes = nh.minutes.map(m => ({
+            startTime: shift(m.startTime),
+            precipitationChance: Math.max(0, Math.min(100, Math.trunc(m.precipitationChance || 0))),
+            precipitationIntensity: Math.max(0, Number(m.precipitationIntensity) || 0),
+            perceivedPrecipitationIntensity: Math.max(0, Number(m.perceivedPrecipitationIntensity) || 0),
+        }));
+        const forecastStart = minutes[0].startTime;
+        for (let i = 0; i < minutes.length; i++) {
+            if (minutes[i].startTime !== forecastStart + 60 * i) return fail(`minutes not contiguous at ${i}`);
+        }
+        const forecastEnd = forecastStart + 60 * minutes.length;
+        const summaries = [];
+        for (const s of (nh.summary || [])) {
+            const cond = WK3_NH_PRECIPITATION[s.condition];
+            if (typeof cond !== "number") return fail(`summary condition unsupported: ${s.condition}`);
+            summaries.push({
+                startTime: shift(s.startTime),
+                endTime: s.endTime ? shift(s.endTime) : 0,
+                condition: cond,
+                precipitationChance: Math.max(0, Math.min(100, Math.trunc(s.precipitationChance || 0))),
+                precipitationIntensity: Math.max(0, Number(s.precipitationIntensity) || 0),
+            });
+        }
+        if (!summaries.length) return fail("no summaries");
+        if (summaries[0].startTime !== forecastStart) return fail("summary[0] start != forecastStart");
+        for (let i = 0; i < summaries.length; i++) {
+            const s = summaries[i], next = summaries[i + 1];
+            if (next) { if (s.endTime !== next.startTime) return fail(`summary gap at ${i}`); }
+            else if (s.endTime !== 0) return fail("last summary endTime != 0");
+        }
+        const conditions = [];
+        for (const c of (nh.condition || [])) {
+            const begin = WK3_NH_CONDITION[c.beginCondition];
+            const end = WK3_NH_CONDITION[c.endCondition];
+            const token = WK3_NH_TOKEN[c.forecastToken];
+            if (typeof begin !== "number" || typeof end !== "number" || typeof token !== "number") {
+                return fail(`condition enum unsupported: ${c.beginCondition}/${c.endCondition}/${c.forecastToken}`);
+            }
+            const params = [];
+            for (const p of (c.parameters || [])) {
+                const type = WK3_NH_PARAMETER[p.type];
+                if (typeof type !== "number") return fail(`parameter type unsupported: ${p.type}`);
+                params.push({ type, date: shift(p.date) });
+            }
+            conditions.push({ startTime: shift(c.startTime), endTime: c.endTime ? shift(c.endTime) : 0, begin, end, token, params });
+        }
+        if (!conditions.length) return fail("no conditions");
+        if (conditions[0].startTime !== forecastStart) return fail("condition[0] start != forecastStart");
+        for (let i = 0; i < conditions.length; i++) {
+            const c = conditions[i], next = conditions[i + 1];
+            if (next) { if (c.endTime !== next.startTime) return fail(`condition gap at ${i}`); }
+            else if (c.endTime !== 0) return fail("last condition endTime != 0");
+        }
         const align4 = v => Math.ceil(v / 4) * 4;
         const align8 = v => Math.ceil(v / 8) * 8;
-
         // ---- size planning (cursor walk, no writes yet) ----
         const newRootVtablePos = 4;
         const newRootPos = align4(newRootVtablePos + rootVtableLen);
@@ -2951,24 +3042,24 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const condVecPos = align4(cursor); cursor += 4 + 4 * conditions.length;
         const condTables = [];
         for (const c of conditions) {
-            const params = Array.isArray(c.parameters) ? c.parameters : [];
             const vt = align4(cursor); cursor += 16;
             const tp = align4(cursor); cursor += 20;
-            const pv = align4(cursor); cursor += 4 + 4 * params.length;
+            const pv = align4(cursor); cursor += 4 + 4 * c.params.length;
             const ptables = [];
-            for (let j = 0; j < params.length; j++) {
+            for (let j = 0; j < c.params.length; j++) {
                 const pvt = align4(cursor); cursor += 8;
                 const ptp = align4(cursor); cursor += 12;
                 ptables.push({ vtable: pvt, table: ptp });
             }
-            condTables.push({ vtable: vt, table: tp, paramsVec: pv, params, ptables });
+            condTables.push({ vtable: vt, table: tp, paramsVec: pv, params: c.params, ptables });
         }
         const summVecPos = align4(cursor); cursor += 4 + 4 * summaries.length;
         const summTables = [];
         for (let j = 0; j < summaries.length; j++) {
             const vt = align4(cursor); cursor += 14;
-            const tp = align4(cursor); cursor += 20;
-            summTables.push({ vtable: vt, table: tp });
+            const tp = align4(cursor); cursor += 24;
+            const cv = align4(cursor); cursor += 8; // byte vector: [u32 len=1][value][zero pad]
+            summTables.push({ vtable: vt, table: tp, condVec: cv });
         }
         const minVecPos = align4(cursor); cursor += 4 + 4 * minutes.length;
         const minTables = [];
@@ -2985,8 +3076,8 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const setU32 = (p, v) => view.setUint32(p, v, true);
         const setF32 = (p, v) => view.setFloat32(p, Math.fround(v), true);
         const setI8 = (p, v) => view.setInt8(p, v);
+        const setU8 = (p, v) => view.setUint8(p, v);
         const writeString = (pos, bytes) => { setU32(pos, bytes.length); out.set(bytes, pos + 4); };
-
         // ---- root ----
         setU32(0, newRootPos);
         out.set(rawBody.subarray(rootVtablePos, rootVtablePos + rootVtableLen), newRootVtablePos);
@@ -3003,31 +3094,19 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             setU32(newFieldPos, origTarget + blobOffset - newFieldPos);
         }
         setU32(newRootPos + rootTableSize, nhPos - (newRootPos + rootTableSize));
-
-        // ---- NextHour table ----
-        // windowOnly: fields 0/1/2/5 must be ABSENT via vtable entry 0 (a 0 slot
-        // value is not absent in FlatBuffers, it is a self-referential offset).
+        // ---- NextHour table (6 fields: metadata, condition[], summary[], start, end, minutes[]) ----
         setU16(nhVtablePos, 16); setU16(nhVtablePos + 2, 28);
-        if (windowOnly) {
-            setU16(nhVtablePos + 4 + 0 * 2, 0); setU16(nhVtablePos + 4 + 1 * 2, 0);
-            setU16(nhVtablePos + 4 + 2 * 2, 0); setU16(nhVtablePos + 4 + 3 * 2, 12);
-            setU16(nhVtablePos + 4 + 4 * 2, 8); setU16(nhVtablePos + 4 + 5 * 2, 0);
-        } else {
-            setU16(nhVtablePos + 4 + 0 * 2, 24); setU16(nhVtablePos + 4 + 1 * 2, 20);
-            setU16(nhVtablePos + 4 + 2 * 2, 16); setU16(nhVtablePos + 4 + 3 * 2, 12);
-            setU16(nhVtablePos + 4 + 4 * 2, 8); setU16(nhVtablePos + 4 + 5 * 2, 4);
-        }
+        setU16(nhVtablePos + 4 + 0 * 2, 24); setU16(nhVtablePos + 4 + 1 * 2, 20);
+        setU16(nhVtablePos + 4 + 2 * 2, 16); setU16(nhVtablePos + 4 + 3 * 2, 12);
+        setU16(nhVtablePos + 4 + 4 * 2, 8); setU16(nhVtablePos + 4 + 5 * 2, 4);
         setI32(nhPos, nhPos - nhVtablePos);
-        if (!windowOnly) {
-            setU32(nhPos + 24, metaPos - (nhPos + 24));
-            setU32(nhPos + 20, condVecPos - (nhPos + 20));
-            setU32(nhPos + 16, summVecPos - (nhPos + 16));
-            setU32(nhPos + 4, minVecPos - (nhPos + 4));
-        }
-        setI32(nhPos + 12, Math.trunc(nh.forecastStart || 0));
-        setI32(nhPos + 8, Math.trunc(nh.forecastEnd || 0));
-
-        // ---- metadata ----
+        setU32(nhPos + 24, metaPos - (nhPos + 24));
+        setU32(nhPos + 20, condVecPos - (nhPos + 20));
+        setU32(nhPos + 16, summVecPos - (nhPos + 16));
+        setU32(nhPos + 4, minVecPos - (nhPos + 4));
+        setI32(nhPos + 12, forecastStart);
+        setI32(nhPos + 8, forecastEnd);
+        // ---- metadata (11 fields, same layout as WK2 Metadata) ----
         setU16(metaVtablePos, 26); setU16(metaVtablePos + 2, 44);
         const metaOffs = [36, 32, 28, 24, 20, 16, 12, 8, 4, 0, 40];
         for (let f = 0; f < 11; f++) setU16(metaVtablePos + 4 + f * 2, metaOffs[f]);
@@ -3035,14 +3114,13 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         if (strPos.attributionUrl !== undefined) { writeString(strPos.attributionUrl, strBytes.attributionUrl); setU32(metaPos + 36, strPos.attributionUrl - (metaPos + 36)); }
         setI32(metaPos + 32, Math.trunc(md.expireTime || 0));
         if (strPos.language !== undefined) { writeString(strPos.language, strBytes.language); setU32(metaPos + 28, strPos.language - (metaPos + 28)); }
-        setF32(metaPos + 24, md.latitude || 0);
-        setF32(metaPos + 20, md.longitude || 0);
+        setF32(metaPos + 24, metaLat);
+        setF32(metaPos + 20, metaLon);
         if (strPos.providerLogo !== undefined) { writeString(strPos.providerLogo, strBytes.providerLogo); setU32(metaPos + 16, strPos.providerLogo - (metaPos + 16)); }
         if (strPos.providerName !== undefined) { writeString(strPos.providerName, strBytes.providerName); setU32(metaPos + 12, strPos.providerName - (metaPos + 12)); }
         setI32(metaPos + 8, Math.trunc(md.readTime || 0));
         setI32(metaPos + 4, Math.trunc(md.reportedTime || 0));
-        setI8(metaPos + 40, SOURCE_TYPE[md.sourceType] ?? 1);
-
+        setI8(metaPos + 40, sourceType);
         // ---- condition vector + tables ----
         setU32(condVecPos, conditions.length);
         conditions.forEach((c, i) => {
@@ -3054,11 +3132,11 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             setU16(t.vtable + 4 + 4 * 2, 8); setU16(t.vtable + 4 + 5 * 2, 4);
             setI32(t.table, t.table - t.vtable);
             setU32(t.table + 4, t.paramsVec - (t.table + 4));
-            setI8(t.table + 8, CONDITION_TYPE[c.endCondition]);
-            setI8(t.table + 9, CONDITION_TYPE[c.beginCondition]);
-            setI8(t.table + 10, FORECAST_TOKEN[c.forecastToken]);
-            setI32(t.table + 12, Math.trunc(c.endTime || 0));
-            setI32(t.table + 16, Math.trunc(c.startTime || 0));
+            setI8(t.table + 8, c.end);
+            setI8(t.table + 9, c.begin);
+            setI8(t.table + 10, c.token);
+            setI32(t.table + 12, c.endTime);
+            setI32(t.table + 16, c.startTime);
             setU32(t.paramsVec, t.params.length);
             t.params.forEach((p, j) => {
                 const pt = t.ptables[j];
@@ -3066,28 +3144,31 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
                 setU16(pt.vtable, 8); setU16(pt.vtable + 2, 12);
                 setU16(pt.vtable + 4 + 0 * 2, 4); setU16(pt.vtable + 4 + 1 * 2, 8);
                 setI32(pt.table, pt.table - pt.vtable);
-                setI8(pt.table + 4, PARAMETER_TYPE[p.type] ?? 0);
-                setI32(pt.table + 8, Math.trunc(p.date || 0));
+                setI8(pt.table + 4, p.type);
+                setI32(pt.table + 8, p.date);
             });
         });
-
-        // ---- summary vector + tables ----
+        // ---- summary vector + tables (condition is a BYTE VECTOR, not a scalar) ----
         setU32(summVecPos, summaries.length);
         summaries.forEach((s, i) => {
             const t = summTables[i];
             setU32(summVecPos + 4 + i * 4, t.table - (summVecPos + 4 + i * 4));
-            setU16(t.vtable, 14); setU16(t.vtable + 2, 20);
-            setU16(t.vtable + 4 + 0 * 2, 16); setU16(t.vtable + 4 + 1 * 2, 12);
-            setU16(t.vtable + 4 + 2 * 2, 9); setU16(t.vtable + 4 + 3 * 2, 8);
+            setU16(t.vtable, 14); setU16(t.vtable + 2, 24);
+            setU16(t.vtable + 4 + 0 * 2, 20); setU16(t.vtable + 4 + 1 * 2, 16);
+            setU16(t.vtable + 4 + 2 * 2, 12); setU16(t.vtable + 4 + 3 * 2, 8);
             setU16(t.vtable + 4 + 4 * 2, 4);
             setI32(t.table, t.table - t.vtable);
-            setF32(t.table + 4, s.precipitationIntensity || 0);
-            setI8(t.table + 8, s.precipitationChance || 0);
-            setI8(t.table + 9, PRECIPITATION_TYPE[s.condition] ?? 0);
-            setI32(t.table + 12, Math.trunc(s.endTime || 0));
-            setI32(t.table + 16, Math.trunc(s.startTime || 0));
+            setF32(t.table + 4, s.precipitationIntensity);
+            setI8(t.table + 8, s.precipitationChance);
+            setU32(t.table + 12, t.condVec - (t.table + 12));
+            setI32(t.table + 16, s.endTime);
+            setI32(t.table + 20, s.startTime);
+            // byte vector: [u32 len=1][value][zero] — zero padding keeps it readable
+            // as u8 and as u16 (PR #108 singleton note).
+            setU32(t.condVec, 1);
+            setU8(t.condVec + 4, s.condition);
+            setU8(t.condVec + 5, 0);
         });
-
         // ---- minutes vector + tables ----
         setU32(minVecPos, minutes.length);
         minutes.forEach((m, i) => {
@@ -3097,15 +3178,13 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             setU16(t.vtable + 4 + 0 * 2, 16); setU16(t.vtable + 4 + 1 * 2, 12);
             setU16(t.vtable + 4 + 2 * 2, 8); setU16(t.vtable + 4 + 3 * 2, 4);
             setI32(t.table, t.table - t.vtable);
-            setF32(t.table + 4, m.perceivedPrecipitationIntensity || 0);
-            setF32(t.table + 8, m.precipitationIntensity || 0);
-            setI8(t.table + 12, m.precipitationChance || 0);
-            setI32(t.table + 16, Math.trunc(m.startTime || 0));
+            setF32(t.table + 4, m.perceivedPrecipitationIntensity);
+            setF32(t.table + 8, m.precipitationIntensity);
+            setI8(t.table + 12, m.precipitationChance);
+            setI32(t.table + 16, m.startTime);
         });
-
         // ---- blob ----
         out.set(rawBody, blobOffset);
-
         // ---- self-check (unsigned forward offsets, like the beta13 AQ fix) ----
         const chk = new flatbuffers.ByteBuffer(out);
         const chkRoot = chk.readInt32(0);
@@ -3113,14 +3192,10 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const chkNhOff = chk.__offset(chkRoot, 4 + 5 * 2);
         if (!chkNhOff) return fail("self-check slot 5 absent");
         const chkNh = chk.__indirect(chkRoot + chkNhOff);
-        if (windowOnly) {
-            if (chk.__offset(chkNh, 4) || chk.__offset(chkNh, 6) || chk.__offset(chkNh, 8) || chk.__offset(chkNh, 14)) return fail("self-check windowOnly fields not absent");
-            const chkStartOff = chk.__offset(chkNh, 10);
-            const chkEndOff = chk.__offset(chkNh, 12);
-            if (!chkStartOff || chk.readInt32(chkNh + chkStartOff) !== Math.trunc(nh.forecastStart || 0)) return fail("self-check windowOnly start");
-            if (!chkEndOff || chk.readInt32(chkNh + chkEndOff) !== Math.trunc(nh.forecastEnd || 0)) return fail("self-check windowOnly end");
-            return { body: out, log: `WK3 nhFill: slot 5 created (windowOnly)${opts.shiftToNow ? " (shiftToNow)" : ""} minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}` };
-        }
+        const chkStartOff = chk.__offset(chkNh, 10);
+        const chkEndOff = chk.__offset(chkNh, 12);
+        if (!chkStartOff || chk.readInt32(chkNh + chkStartOff) !== forecastStart) return fail("self-check start");
+        if (!chkEndOff || chk.readInt32(chkNh + chkEndOff) !== forecastEnd) return fail("self-check end");
         const chkNhMetaOff = chk.__offset(chkNh, 4);
         const chkMeta = chk.__indirect(chkNh + chkNhMetaOff);
         const chkProvOff = chk.__offset(chkMeta, 16);
@@ -3131,6 +3206,12 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             chkProv = new TextDecoder().decode(out.subarray(sp + 4, sp + 4 + slen));
         }
         if (chkProv !== (md.providerName || "")) return fail("self-check providerName mismatch");
+        const chkLatOff = chk.__offset(chkMeta, 10);
+        const chkLonOff = chk.__offset(chkMeta, 12);
+        if (!chkLatOff || !chkLonOff) return fail("self-check meta lat/lon absent");
+        const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+        if (dv.getFloat32(chkMeta + chkLatOff, true) !== Math.fround(metaLat)) return fail("self-check lat");
+        if (dv.getFloat32(chkMeta + chkLonOff, true) !== Math.fround(metaLon)) return fail("self-check lon");
         const checkVec = (vecPos, want) => {
             if (chk.readUint32(vecPos) !== want) return false;
             for (let i = 0; i < want; i++) {
@@ -3150,11 +3231,23 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             const slot = chkMinVec + 4 + i * 4;
             const mt = slot + chk.readUint32(slot);
             const stOff = chk.__offset(mt, 4);
-            if (!stOff || chk.readInt32(mt + stOff) !== Math.trunc(minutes[i].startTime)) return fail(`self-check minute ${i} startTime`);
+            if (!stOff || chk.readInt32(mt + stOff) !== minutes[i].startTime) return fail(`self-check minute ${i} startTime`);
+        }
+        // summary condition byte vector: length 1, byte == expected, zero pad after.
+        const chkSummVec = chk.__indirect(chkNh + chkSummOff);
+        for (let i = 0; i < summaries.length; i++) {
+            const slot = chkSummVec + 4 + i * 4;
+            const st = slot + chk.readUint32(slot);
+            const condOff = chk.__offset(st, 8);
+            if (!condOff) return fail(`self-check summary ${i} condition absent`);
+            const cv = chk.__indirect(st + condOff);
+            if (chk.readUint32(cv) !== 1 || out[cv + 4] !== summaries[i].condition || out[cv + 5] !== 0) {
+                return fail(`self-check summary ${i} condition vector`);
+            }
         }
         return {
             body: out,
-            log: `WK3 nhFill: slot 5 created${minimal ? " (minimal bisect)" : ""}${opts.shiftToNow ? " (shiftToNow)" : ""} minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
+            log: `WK3 nhFill: slot 5 created (beta8 PR#108 spec${opts.shiftToNow ? " shiftToNow" : ""}) minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
         };
     } catch (e) {
         return { body: null, log: `WK3 nhFill: skipped (exception ${e?.message ?? e})` };
