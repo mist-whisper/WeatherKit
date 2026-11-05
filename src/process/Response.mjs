@@ -166,7 +166,7 @@ export async function Response($request, $response) {
                                             nhReplace = { body: null, log: "WK3 nh: skipped (provider error)" };
                                         }
                                         if (nhData?.minutes?.length) {
-                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { minimal: true }); // BISECT beta2: minimal slot 5 (metadata only)
+                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { shiftToNow: true }); // BISECT beta3: full fill, window shifted to now
                                             if (nhReplace.body) {
                                                 workingBody = nhReplace.body;
                                                 workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
@@ -1641,6 +1641,19 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const minutes = minimal ? [] : nh.minutes;
         const md = nh.metadata || {};
 
+        // BISECT beta3: shift window to now (provider window starts 60-120s in the past)
+        if (opts.shiftToNow) {
+            const nowSec = Math.trunc(Date.now() / 1000);
+            const delta = nowSec - Math.trunc(nh.forecastStart || 0);
+            if (delta > 0) {
+                nh.forecastStart = Math.trunc(nh.forecastStart || 0) + delta;
+                nh.forecastEnd = Math.trunc(nh.forecastEnd || 0) + delta;
+                for (const m of minutes) m.startTime = Math.trunc(m.startTime || 0) + delta;
+                for (const s of summaries) { s.startTime = Math.trunc(s.startTime || 0) + delta; if (s.endTime) s.endTime = Math.trunc(s.endTime) + delta; }
+                for (const c of conditions) { c.startTime = Math.trunc(c.startTime || 0) + delta; if (c.endTime) c.endTime = Math.trunc(c.endTime) + delta; for (const p of (c.parameters || [])) p.date = Math.trunc(p.date || 0) + delta; }
+            }
+        }
+
         const align4 = v => Math.ceil(v / 4) * 4;
         const align8 = v => Math.ceil(v / 8) * 8;
 
@@ -1850,7 +1863,7 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         }
         return {
             body: out,
-            log: `WK3 nhFill: slot 5 created${minimal ? " (minimal bisect)" : ""} minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
+            log: `WK3 nhFill: slot 5 created${minimal ? " (minimal bisect)" : ""}${opts.shiftToNow ? " (shiftToNow)" : ""} minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
         };
     } catch (e) {
         return { body: null, log: `WK3 nhFill: skipped (exception ${e?.message ?? e})` };
