@@ -31,7 +31,7 @@ export default function parseWeatherKitURL(url = new URL($request.url)) {
             break;
         }
         default: {
-            const scaleParameters = url.pathname.match(/^\/api\/(?<version>v1)\/airQualityScale\/(?<language>[A-Z0-9]+(?:-[A-Z0-9]+)*)\/(?<scale>[^/]+)$/i)?.groups;
+            const scaleParameters = url.pathname.match(/^\/api\/(?<version>v\d+)\/airQualityScale\/(?<language>[A-Z0-9]+(?:-[A-Z0-9]+)*)\/(?<scale>[^/]+)$/i)?.groups;
             if (scaleParameters) {
                 result.version = scaleParameters.version;
                 result.language = scaleParameters.language;

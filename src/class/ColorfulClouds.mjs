@@ -289,7 +289,10 @@ export default class ColorfulClouds {
                                 temporarilyUnavailable: false,
                                 sourceType: "MODELED",
                             };
-                            body.result.minutely.probability = body.result.minutely.probability.map(probability => Math.round(probability * 100));
+                            // 概率单位双约定：文档称 0~1，v2.6 实测返回 0~100（百分制）。
+                            // 直接 *100 会使 30 变成 3000，写 int8 后溢出为 -72（非法概率）。
+                            // 归一化：>1 视为已是百分制，否则 *100；结果钳制到 0~100。
+                            body.result.minutely.probability = body.result.minutely.probability.map(probability => Math.round(Math.max(0, Math.min(100, probability > 1 ? probability : probability * 100))));
                             let minuteStemp = new Date(body?.server_time * 1000).setSeconds(0, 0);
                             minuteStemp = minuteStemp.valueOf() / 1000 - 60;
                             forecastNextHour = {
