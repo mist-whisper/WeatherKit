@@ -179,21 +179,32 @@ export async function Response($request, $response) {
                                     workingBody = hourlyReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
-                                // 未来一小时移植对照·源名本地变体（WK3 3.4.2-beta2）：把真实 Apple 东京槽 5
-                                // 原样拼进本城市的体，判别槽 5 存在性本身是不是 breaker（§187：
-                                // beta8 按 PR #108 规格重建的填空仍被拒收）。填空路线旁路停放，
-                                // fillWK3NextHour 留在文件里，判别后再决定恢复填空还是停放 NextHour。
+                                // 未来一小时填空（WK3 3.4.2-beta3）：按 PR #108 规格重建槽 5，
+                                // §189 清单已修：① attributionUrl 截断（cursor = metaPos + 44，
+                                // 并把 attributionUrl 加入自检）、② 均匀窗口 token CLEAR=1 →
+                                // CONSTANT=6、③ writer 省略默认 0 字段（Builder 布局）。
+                                // ④ shiftToNow 锚定 asOf 不必做，beta2 移植窗口时间已被接受。
                                 // 只在 forecastNextHour 在 dataSets 且国家在 Replace 时跑；
-                                // 不取 provider 数据（移植用的是东京真字节）；任一失败原样返回，
-                                // 元数据 providerName/attributionUrl 改为本地值（排除 JMA 源名干扰，§196）；
-                                // 不影响其他槽。面板若出现，显示的是东京的雨（对照本意，不是 bug）。
+                                // provider 默认彩云（InjectForecastNextHour 默认分支），
+                                // 窗口移至今；任一失败原样返回，不影响其他槽。
+                                // 移植对照已完成使命（beta1/beta2 判别：错在源名而非存在性），
+                                // 移植函数与东京十六进制常量已删除，见分支历史。
                                 let nhReplace = { body: null, log: "WK3 nh: skipped (not attempted)" };
                                 if (parameters.dataSets.includes("forecastNextHour") && Settings?.Weather?.Replace?.includes(parameters.country)) {
                                     try {
-                                        nhReplace = transplantWK3NextHourFixed(workingByteBuffer, workingBody);
-                                        if (nhReplace.body) {
-                                            workingBody = nhReplace.body;
-                                            workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
+                                        const nhEnv = {
+                                            colorfulClouds: new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ=="),
+                                            qWeather: new QWeather({ ...parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host),
+                                        };
+                                        const nhData = await InjectForecastNextHour(undefined, Settings, nhEnv);
+                                        if (nhData) {
+                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { shiftToNow: true });
+                                            if (nhReplace.body) {
+                                                workingBody = nhReplace.body;
+                                                workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
+                                            }
+                                        } else {
+                                            nhReplace = { body: null, log: "WK3 nh: skipped (no provider data)" };
                                         }
                                     } catch (e) {
                                         nhReplace = { body: null, log: `WK3 nh: skipped (exception ${e?.message ?? e})` };
@@ -2686,9 +2697,11 @@ async function InjectComparison(airQuality, currentIndexProvider, Settings, Cach
 // Layout rule (beta10 lesson): every vector precedes its element tables;
 // all element uoffsets are forward (small positive).
 
-// WK3 NextHour 枚举（3.4.1-beta8）：PR #108 配对样本值，1 起值；与 WK2 的 0 起值表
+// WK3 NextHour 枚举（3.4.2-beta3）：PR #108 配对样本值，1 起值；与 WK2 的 0 起值表
 // 不同，不可混用（beta7 的 AQ 污染物错位即同类问题）。condition 只认 CLEAR/RAIN/
 // DRIZZLE，precipitation 只认 CLEAR/RAIN，token 无 STOP_START。
+// 注意：token CLEAR=1 只在 proto 里定义，真表中从未出现；provider 的 "CLEAR"
+// token（均匀晴朗窗口）由填空映射为 CONSTANT=6（§189 fix ②）。
 const WK3_NH_CONDITION = { CLEAR: 1, RAIN: 7, DRIZZLE: 8 };
 const WK3_NH_TOKEN = { CLEAR: 1, START: 2, STOP: 3, START_STOP: 4, CONSTANT: 6 };
 const WK3_NH_PRECIPITATION = { CLEAR: 1, RAIN: 2 };
@@ -2696,298 +2709,30 @@ const WK3_NH_PARAMETER = { FIRST_AT: 1, SECOND_AT: 2 };
 const WK3_NH_SOURCE = { MODELED: 2, STATION: 3 };
 
 
-// 东京原表移植探针（beta6）：把 Capture 304 东京原体里的槽 5 子图
-// （JMA 元数据 + 条件/摘要/分钟向量，83 分钟）整体搬进目标体；
-// 只改窗口（移至今）、元数据经纬度（改目标城）与元数据三时间
-// （保留原时长与上报-读取间隔）。不拉 provider、不调 fill。
-// blob 布局：[NH vtable 16][NH 表 28] 开头，NH 表在 blob+16。
-const TOKYO_NH_BLOB_HEX = "10001c001800140010000c00080004001000000018000000f400eb6a80edea6ae4070000140800003c08000053000000c00700009c070000840700006c070000540700003c070000240700000c070000f4060000dc060000c4060000ac060000940600007c060000640600004c060000340600001c06000004060000ec050000d4050000bc050000a40500008c050000740500005c050000440500002c05000014050000fc040000e4040000cc040000b40400009c040000840400006c040000540400003c040000240400000c040000f4030000dc030000c4030000ac030000940300007c030000640300004c030000340300001c03000004030000ec020000d4020000bc020000a40200008c020000740200005c020000440200002c02000014020000fc010000e4010000cc010000b40100009c010000840100006c010000540100003c010000240100000c010000f4000000dc000000c4000000ac000000940000007c000000640000004c000000340000001c0000000400000098f9ffff60e5f03f3358a14000000061b800eb6aacf9ffff60e5f03f3358a140000000627c00eb6ac0f9ffff60e5f03f3358a140000000624000eb6ad4f9ffff60e5f03f3358a140000000620400eb6ae8f9ffff60e5f03f3358a14000000062c8ffea6afcf9ffff60e5f03f3358a140000000628cffea6a10faffff60e5f03f3358a1400000006350ffea6a24faffff60e5f03f3358a1400000006314ffea6a38faffff60e5f03f3358a14000000063d8feea6a4cfafffff2d2ed3fcda19a40000000639cfeea6a60fafffff2d2ed3fcda19a400000006360feea6a74fafffff2d2ed3fcda19a400000006424feea6a88faffff83c0ea3fea32944000000064e8fdea6a9cfaffff83c0ea3fea32944000000064acfdea6ab0faffff83c0ea3fea3294400000006470fdea6ac4faffff14aee73f85088e400000006434fdea6ad8faffffa69be43fcb1f884000000064f8fcea6aecfaffffa69be43fcb1f884000000064bcfcea6a00fbffff7368e13f017682400000006480fcea6a14fbffff0456de3f18117a400000006444fcea6a28fbffff9643db3fc2a96f400000006408fcea6a3cfbffffec51d83f3ab1654000000064ccfbea6a50fbffff7d3fd53fe7225c400000006490fbea6a64fbffff0e2dd23f5bfa52400000006454fbea6a78fbfffff628cc3fd0c941400000006418fbea6a8cfbffff4c37c93fdeb9394000000064dcfaea6aa0fbfffff853c33f06982a4000000064a0faea6ab4fbffff4e62c03f207f23400000006464faea6ac8fbfffffa7eba3ff12c16400000006428faea6adcfbffff2fddb43f9af0094000000064ecf9ea6af0fbffff4a0cb23f7c33044000000064b0f9ea6a04fcffff7f6aac3f1cdcf23f0000006474f9ea6a18fcffff79e9a63f9412df3f0000006438f9ea6a2cfcffff5839a43fbecad53f00000064fcf8ea6a40fcffff17d99e3f815fc43f00000064c0f8ea6a54fcffffba499c3f0c34bc3f0000006484f8ea6a68fcffff9a99993f995fb43f0000006448f8ea6a7cfcffff3d0a973f88deac3f000000640cf8ea6a90fcffffa69b943f66ada53f00000064d0f7ea6aa4fcffffa69b943f66ada53f0000006494f7ea6ab8fcffff4a0c923fdac89e3f0000006458f7ea6accfcffff4a0c923fdac89e3f000000641cf7ea6ae0fcffff4a0c923fdac89e3f00000064e0f6ea6af4fcffffa69b943f66ada53f00000064a4f6ea6a08fdffff3d0a973f88deac3f0000006468f6ea6a1cfdffff9a99993f995fb43f000000642cf6ea6a30fdffffba499c3f0c34bc3f00000064f0f5ea6a44fdffff17d99e3f815fc43f00000064b4f5ea6a58fdffff5839a43fbecad53f0000006478f5ea6a6cfdffff79e9a63f9412df3f000000643cf5ea6a80fdffff7f6aac3f1cdcf23f0000006400f5ea6a94fdffff4a0cb23f7c33044000000064c4f4ea6aa8fdffff14aeb73f81ed0f400000006488f4ea6abcfdfffffa7eba3ff12c1640000000644cf4ea6ad0fdffff4e62c03f207f23400000006410f4ea6ae4fdffffa245c63fceff314000000064d4f3ea6af8fdffff4c37c93fdeb939400000006498f3ea6a0cfefffff628cc3fd0c94140000000645cf3ea6a20feffff643bcf3f55334a400000006420f3ea6a34feffff0e2dd23f5bfa524000000064e4f2ea6a48feffff7d3fd53fe7225c4000000064a8f2ea6a5cfeffffec51d83f3ab16540000000646cf2ea6a70feffff9643db3fc2a96f400000006430f2ea6a84feffff9643db3fc2a96f4000000064f4f1ea6a98feffff9643db3fc2a96f4000000064b8f1ea6aacfeffff0456de3f18117a40000000647cf1ea6ac0feffff0456de3f18117a400000006440f1ea6ad4feffff0456de3f18117a400000006404f1ea6ae8feffff0456de3f18117a4000000064c8f0ea6afcfeffff9643db3fc2a96f40000000648cf0ea6a10ffffff9643db3fc2a96f400000006450f0ea6a24ffffffec51d83f3ab165400000006414f0ea6a38ffffff7d3fd53fe7225c4000000064d8efea6a4cffffff0e2dd23f5bfa5240000000649cefea6a60fffffff628cc3fd0c941400000006460efea6a74ffffffa245c63fceff31400000006424efea6a88ffffff4e62c03f207f234000000064e8eeea6a9cfffffffa7eba3ff12c164000000064aceeea6ab0ffffff4a0cb23f7c3304400000006470eeea6ac4ffffff7f6aac3f1cdcf23f0000006434eeea6ad8ffffff5839a43fbecad53f00000064f8edea6aecffffff17d99e3f815fc43f00000064bcedea6a0c00140010000f00080004000c0000009a99993f995fb43f0000006480edea6a010000001400000000000e001400100000000c000b0004000e0000003358a140000000640800000080edea6a01000000020000000100000014000000100010000c0000000b000a0009000400100000000c0000000007070680edea6a00000000da37ffff00000002dcebea6a84edea6a1400000014ce0b439a190f4208f1ea6a240000001b0000004a6170616e204d6574656f726f6c6f676963616c204167656e6379004800000068747470733a2f2f646576656c6f7065722e6170706c652e636f6d2f776561746865726b69742f646174612d736f757263652d6174747269627574696f6e2d696e7465726e616c2f"; // Tokyo capture[896:3188], 2292 bytes (real Apple bytes, §190; NOT the old re-serialized TOKYO_NH_HEX)
-const TOKYO_NH_META_VT_HEX = "1a00240020001c00000018001400000010000c00080000000700"; // Tokyo capture[54282:54308], 26 bytes (shared metadata vtable, FIX 2)
-function hexToBytes(hex) {
-    const out = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-    return out;
-}
-function utf8Bytes(str) {
-    const s = unescape(encodeURIComponent(str));
-    const out = new Uint8Array(s.length);
-    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-    return out;
-}
-// ---- WK3 NextHour transplant control, localized-source variant (3.4.2-beta2):
-// splice the REAL Apple Tokyo
-// slot 5 into a slot-5-less body, to test on-device whether slot 5's EXISTENCE is
-// the breaker (§187: the beta8 fill per PR #108 spec was still rejected).
-// The blob is the real capture bytes (Tokyo capture[896:3188], 2292 bytes) — NOT the
-// old TOKYO_NH_HEX, which was a re-serialized version (§190). The metadata vtable
-// is shared with slot-0 AQ metadata in the Tokyo body (at 54282), so it is embedded
-// separately and appended to the blob (FIX 2). Loon has no filesystem, so both byte
-// strings are embedded as hex constants below (extracted offline, verified against
-// the capture in beta1-342-extract.mjs).
-// FIX 1 (§183): root vtable TABLE-SIZE field bumped +4 (the old transplant forgot).
-// FIX 2 (§190): metadata vtable copy appended to the blob, soffset repointed.
-// beta2 variant (§196): providerName is localized to "彩云天气" and attributionUrl
-// to "https://www.caiyunapp.com/h5" (in-place string patch; new strings are shorter,
-// so they fit the original allocations); lat/lon are set to the target
-// city's (from the base body's slot-0 AQ metadata); times shift uniformly to now
-// (minute-floored window start, readTime = exact now — Apple's pattern).
-// Any failure returns the original body. fillWK3NextHour stays in the file, parked,
-// so the fill route can be restored after this control.
-const TOKYO_NH_META_TABLE_OFF = 2148; // metadata table offset inside the blob
-const TOKYO_NH_COUNTS = { minutes: 83, summaries: 1, conditions: 1 };
-function transplantWK3NextHourFixed(ByteBuffer, rawBody, opts = {}) {
-    const align4 = (v) => (v + 3) & ~3;
-    const align8 = (v) => (v + 7) & ~7;
-    const fail = (reason) => ({ body: null, log: `WK3 nhTransplant: skipped (${reason})` });
-    try {
-        const bb = ByteBuffer;
-        const rootPos = bb.readInt32(bb.position()) + bb.position();
-        const rootVtablePos = rootPos - bb.readInt32(rootPos);
-        const rootVtableLen = bb.readUint16(rootVtablePos);
-        const rootTableSize = bb.readUint16(rootVtablePos + 2);
-        if (rootVtableLen !== 15 * 2 + 4) return fail('root not 15 fields');
-        if (bb.__offset(rootPos, 4 + 5 * 2)) return fail('slot 5 present');
-        // Target lat/lon: explicit override, else base body's slot-0 AQ metadata.
-        let targetLat = opts.targetLat, targetLon = opts.targetLon;
-        if (targetLat === undefined || targetLon === undefined) {
-            const slot0Off = bb.__offset(rootPos, 4 + 0 * 2);
-            if (!slot0Off) return fail('slot 0 absent');
-            const aqTable = bb.__indirect(rootPos + slot0Off);
-            const aqMetaOff = bb.__offset(aqTable, 4 + 0 * 2);
-            if (!aqMetaOff) return fail('AQ metadata absent');
-            const aqMeta = bb.__indirect(aqTable + aqMetaOff);
-            const latOff = bb.__offset(aqMeta, 4 + 3 * 2);
-            const lonOff = bb.__offset(aqMeta, 4 + 4 * 2);
-            if (!latOff || !lonOff) return fail('AQ lat/lon absent');
-            const dv = new DataView(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength);
-            const la = dv.getFloat32(aqMeta + latOff, true);
-            const lo = dv.getFloat32(aqMeta + lonOff, true);
-            if (!Number.isFinite(la) || !Number.isFinite(lo)) return fail('AQ lat/lon not finite');
-            if (targetLat === undefined) targetLat = la;
-            if (targetLon === undefined) targetLon = lo;
-        }
-        // Embedded real Tokyo blob + shared metadata vtable (no filesystem in Loon).
-        const extBlob = hexToBytes(TOKYO_NH_BLOB_HEX);
-        const extMetaVtable = hexToBytes(TOKYO_NH_META_VT_HEX);
-        // FIX 2: append a copy of the shared metadata vtable to the blob and
-        // repoint the metadata table's soffset at the copy.
-        const tpl = new Uint8Array(align4(extBlob.length) + align4(extMetaVtable.length));
-        tpl.set(extBlob, 0);
-        const vtCopyOff = align4(extBlob.length);
-        tpl.set(extMetaVtable, vtCopyOff);
-        const td = new DataView(tpl.buffer);
-        const nhPos = 16; // nh table is at blob offset 16 (vtable 0..16, table 16..)
-        const nhVt = nhPos - td.getInt32(nhPos, true);
-        // Metadata table position (relative to blob start) and its new soffset.
-        const metaTablePos = TOKYO_NH_META_TABLE_OFF;
-        td.setInt32(metaTablePos, metaTablePos - vtCopyOff, true);
-        const fOff = (vt, f) => {
-            const vlen = td.getUint16(vt, true);
-            return (4 + f * 2 < vlen) ? td.getUint16(vt + 4 + f * 2, true) : 0;
-        };
-        const ind = (pos) => pos + td.getUint32(pos, true);
-        const nowExact = Math.trunc(Date.now() / 1000);
-        const nowFloor = nowExact - (nowExact % 60);
-        const startOff = fOff(nhVt, 3);
-        const endOff = fOff(nhVt, 4);
-        if (!startOff || !endOff) return fail('NH window fields absent');
-        const origStart = td.getInt32(nhPos + startOff, true);
-        const origEnd = td.getInt32(nhPos + endOff, true);
-        const delta = opts.shiftToNow === false ? 0 : (nowFloor - origStart);
-        const shift = (tablePos, vtPos, field) => {
-            const o = fOff(vtPos, field);
-            if (o) td.setInt32(tablePos + o, td.getInt32(tablePos + o, true) + delta, true);
-        };
-        td.setInt32(nhPos + startOff, origStart + delta, true);
-        td.setInt32(nhPos + endOff, origEnd + delta, true);
-        const metaOff = fOff(nhVt, 0);
-        if (!metaOff) return fail('NH metadata absent');
-        const metaPos = ind(nhPos + metaOff);
-        const metaVt = metaPos - td.getInt32(metaPos, true);
-        const mLat = fOff(metaVt, 3), mLon = fOff(metaVt, 4);
-        const mExp = fOff(metaVt, 1), mRead = fOff(metaVt, 7), mRep = fOff(metaVt, 8);
-        if (!mLat || !mLon || !mExp || !mRead || !mRep) return fail('metadata fields absent');
-        const origRead = td.getInt32(metaPos + mRead, true);
-        const origExp = td.getInt32(metaPos + mExp, true);
-        const origRep = td.getInt32(metaPos + mRep, true);
-        td.setFloat32(metaPos + mLat, Math.fround(targetLat), true);
-        td.setFloat32(metaPos + mLon, Math.fround(targetLon), true);
-        // Metadata times keep their relative offsets; readTime = exact now (Apple
-        // pattern: Tokyo readTime is 4s after forecastStart, not minute-floored).
-        td.setInt32(metaPos + mRead, nowExact, true);
-        td.setInt32(metaPos + mRep, nowExact - (origRead - origRep), true);
-        td.setInt32(metaPos + mExp, nowExact + (origExp - origRead), true);
-        // beta2 variant (§196): localize the metadata source name in place to
-        // exclude the JMA interference. New strings are shorter than the
-        // originals, so they fit in the original allocations: rewrite the
-        // length prefix, write the bytes, zero the leftover tail. uoffsets
-        // and the vtable are untouched (strings stay at the same positions).
-        const patchMetaString = (fieldIdx, newText) => {
-            const fo = fOff(metaVt, fieldIdx);
-            if (!fo) return false;
-            const strPos = ind(metaPos + fo);
-            const bytes = utf8Bytes(newText);
-            const oldLen = td.getUint32(strPos, true);
-            const oldAlloc = 4 + align4(oldLen);
-            const newAlloc = 4 + align4(bytes.length);
-            if (newAlloc > oldAlloc) return false;
-            td.setUint32(strPos, bytes.length, true);
-            for (let i = 0; i < bytes.length; i++) td.setUint8(strPos + 4 + i, bytes[i]);
-            for (let i = newAlloc; i < oldAlloc; i++) td.setUint8(strPos + i, 0);
-            return true;
-        };
-        if (!patchMetaString(0, 'https://www.caiyunapp.com/h5')) return fail('metadata attributionUrl patch failed');
-        if (!patchMetaString(6, '彩云天气')) return fail('metadata providerName patch failed');
-        const walkVec = (fieldIdx, isCond, hasEndTime) => {
-            const vo = fOff(nhVt, fieldIdx);
-            if (!vo) return;
-            const vecPos = ind(nhPos + vo);
-            const n = td.getUint32(vecPos, true);
-            for (let i = 0; i < n; i++) {
-                const slot = vecPos + 4 + i * 4;
-                const t = slot + td.getUint32(slot, true);
-                const vt = t - td.getInt32(t, true);
-                shift(t, vt, 0);
-                if (hasEndTime) shift(t, vt, 1);
-                if (isCond) {
-                    const pvo = fOff(vt, 5);
-                    if (pvo) {
-                        const pvec = ind(t + pvo);
-                        const pn = td.getUint32(pvec, true);
-                        for (let j = 0; j < pn; j++) {
-                            const pslot = pvec + 4 + j * 4;
-                            const pt = pslot + td.getUint32(pslot, true);
-                            const pvt = pt - td.getInt32(pt, true);
-                            shift(pt, pvt, 1);
-                        }
-                    }
-                }
-            }
-        };
-        walkVec(1, true, true);
-        walkVec(2, false, true);
-        walkVec(5, false, false); // minute field 1 is u8 chance, not endTime: do not shift
-        // ---- assemble: [new root uoffset][new root vtable][new root table][tpl blob][orig body] ----
-        const newRootVtablePos = 4;
-        const newRootPos = align4(newRootVtablePos + rootVtableLen);
-        const newRootTableSize = rootTableSize + 4;
-        const tplPos = align4(newRootPos + newRootTableSize);
-        const blobOffset = align8(tplPos + tpl.length);
-        const outLen = blobOffset + rawBody.length;
-        const out = new Uint8Array(outLen);
-        const od = new DataView(out.buffer);
-        od.setUint32(0, newRootPos, true);
-        out.set(rawBody.slice(rootVtablePos, rootVtablePos + rootVtableLen), newRootVtablePos);
-        // FIX 1 (§183): bump the root vtable's TABLE-SIZE field (was missing).
-        od.setUint16(newRootVtablePos + 2, newRootTableSize, true);
-        od.setUint16(newRootVtablePos + 4 + 5 * 2, rootTableSize, true);
-        out.set(rawBody.slice(rootPos, rootPos + rootTableSize), newRootPos);
-        od.setInt32(newRootPos, newRootPos - newRootVtablePos, true);
-        const nhNewPos = tplPos + nhPos;
-        od.setUint32(newRootPos + rootTableSize, nhNewPos - (newRootPos + rootTableSize), true);
-        out.set(tpl, tplPos);
-        out.set(rawBody, blobOffset);
-        for (let f = 0; f < 15; f++) {
-            if (f === 5) continue;
-            const o = bb.__offset(rootPos, 4 + f * 2);
-            if (!o) continue;
-            const oldTarget = rootPos + o + bb.readUint32(rootPos + o);
-            const newTarget = oldTarget + blobOffset;
-            od.setUint32(newRootPos + o, newTarget - (newRootPos + o), true);
-        }
-        // ---- self-check: real flatbuffers read-back + PR decoder round-trip ----
-        const chk = new flatbuffers.ByteBuffer(out);
-        const chkRoot = chk.readInt32(chk.position()) + chk.position();
-        const chkRootVt = chkRoot - chk.readInt32(chkRoot);
-        if (chk.readUint16(chkRootVt) !== 15 * 2 + 4) return fail('self-check root fields');
-        if (chk.readUint16(chkRootVt + 2) !== newRootTableSize) return fail('self-check root table size not bumped (FIX 1)');
-        const s5 = chk.__offset(chkRoot, 4 + 5 * 2);
-        if (!s5) return fail('self-check slot 5 absent');
-        if (s5 >= newRootTableSize) return fail('self-check slot 5 entry outside declared table size');
-        const cNh = chk.__indirect(chkRoot + s5);
-        const cNhVt = cNh - chk.readInt32(cNh);
-        const cStartOff = chk.readUint16(cNhVt + 4 + 3 * 2);
-        if (!cStartOff) return fail('self-check NH start absent');
-        const cStart = chk.readInt32(cNh + cStartOff);
-        if (opts.shiftToNow !== false && Math.abs(cStart - nowFloor) > 2) return fail('self-check window start != nowFloor');
-        const cMetaOff = chk.__offset(cNh, 4 + 0 * 2);
-        if (!cMetaOff) return fail('self-check metadata absent');
-        const cMeta = chk.__indirect(cNh + cMetaOff);
-        const cMetaVt = cMeta - chk.readInt32(cMeta);
-        // FIX 2 check: the metadata vtable must now lie inside this body, inside
-        // the transplant blob region, and be byte-identical to Apple's vtable.
-        if (cMetaVt < tplPos || cMetaVt + 26 > tplPos + tpl.length) return fail('self-check metadata vtable outside transplant blob (FIX 2)');
-        for (let i = 0; i < 26; i++) if (out[cMetaVt + i] !== extMetaVtable[i]) return fail('self-check metadata vtable bytes differ from Apple');
-        const cNameOff = chk.__offset(cMeta, 4 + 6 * 2);
-        if (!cNameOff) return fail('self-check providerName absent');
-        const cNamePos = chk.__indirect(cMeta + cNameOff);
-        const cNameLen = chk.readUint32(cNamePos);
-        const cNameBytes = out.slice(cNamePos + 4, cNamePos + 4 + cNameLen);
-        const expName = utf8Bytes('彩云天气');
-        if (cNameLen !== expName.length) return fail('self-check providerName length');
-        for (let i = 0; i < cNameLen; i++) if (cNameBytes[i] !== expName[i]) return fail('self-check providerName bytes');
-        // beta2 variant: attributionUrl must be the local value (§189 lesson:
-        // self-checks must cover attributionUrl, not just providerName).
-        const cUrlOff = chk.__offset(cMeta, 4 + 0 * 2);
-        if (!cUrlOff) return fail('self-check attributionUrl absent');
-        const cUrlPos = chk.__indirect(cMeta + cUrlOff);
-        const cUrlLen = chk.readUint32(cUrlPos);
-        const cUrlBytes = out.slice(cUrlPos + 4, cUrlPos + 4 + cUrlLen);
-        const expUrl = utf8Bytes('https://www.caiyunapp.com/h5');
-        if (cUrlLen !== expUrl.length) return fail('self-check attributionUrl length');
-        for (let i = 0; i < cUrlLen; i++) if (cUrlBytes[i] !== expUrl[i]) return fail('self-check attributionUrl bytes');
-        const cLatOff = chk.__offset(cMeta, 4 + 3 * 2);
-        const cLonOff = chk.__offset(cMeta, 4 + 4 * 2);
-        const od2 = new DataView(out.buffer);
-        if (!cLatOff || !cLonOff) return fail('self-check meta lat/lon absent');
-        if (od2.getFloat32(cMeta + cLatOff, true) !== Math.fround(targetLat)) return fail('self-check lat');
-        if (od2.getFloat32(cMeta + cLonOff, true) !== Math.fround(targetLon)) return fail('self-check lon');
-        const vecCheck = (fieldIdx, expectLen) => {
-            const vo = chk.__offset(cNh, 4 + fieldIdx * 2);
-            if (!vo) return false;
-            const vp = chk.__indirect(cNh + vo);
-            const n = chk.readUint32(vp);
-            if (n !== expectLen) return false;
-            for (let i = 0; i < n; i++) {
-                const off = chk.readUint32(vp + 4 + i * 4);
-                if (off <= 0 || vp + 4 + i * 4 + off >= out.length) return false;
-            }
-            return true;
-        };
-        if (!vecCheck(1, TOKYO_NH_COUNTS.conditions) || !vecCheck(2, TOKYO_NH_COUNTS.summaries) || !vecCheck(5, TOKYO_NH_COUNTS.minutes)) return fail('self-check vectors');
-        const cMinVec = chk.__indirect(cNh + chk.__offset(cNh, 4 + 5 * 2));
-        const cMin0 = cMinVec + 4 + chk.readUint32(cMinVec + 4);
-        const cMin0Vt = cMin0 - chk.readInt32(cMin0);
-        const cMin0StartOff = chk.readUint16(cMin0Vt + 4 + 0 * 2);
-        if (!cMin0StartOff || chk.readInt32(cMin0 + cMin0StartOff) !== cStart) return fail('self-check minute[0] start');
-        // Base-body slots untouched: AQ category/index.
-        const aqCatOff = bb.__offset(bb.__indirect(rootPos + bb.__offset(rootPos, 4 + 0 * 2)), 4 + 1 * 2);
-        const aqIdxOff = bb.__offset(bb.__indirect(rootPos + bb.__offset(rootPos, 4 + 0 * 2)), 4 + 2 * 2);
-        const cAq = chk.__indirect(chkRoot + chk.__offset(chkRoot, 4 + 0 * 2));
-        const cAqCatOff = chk.__offset(cAq, 4 + 1 * 2);
-        const cAqIdxOff = chk.__offset(cAq, 4 + 2 * 2);
-        const origAq = bb.__indirect(rootPos + bb.__offset(rootPos, 4 + 0 * 2));
-        if (aqCatOff && cAqCatOff && bb.readInt8(origAq + aqCatOff) !== chk.readInt8(cAq + cAqCatOff)) return fail('self-check AQ category changed');
-        if (aqIdxOff && cAqIdxOff && bb.readInt16(origAq + aqIdxOff) !== chk.readInt16(cAq + cAqIdxOff)) return fail('self-check AQ index changed');
-        return {
-            body: out,
-            log: `WK3 nhTransplant: slot 5 transplanted (tokyo-local, FIX1+FIX2) minutes=${TOKYO_NH_COUNTS.minutes} summaries=${TOKYO_NH_COUNTS.summaries} conditions=${TOKYO_NH_COUNTS.conditions} provider=彩云天气 window ${cStart}->${origEnd + delta} latlon ${targetLat.toFixed(4)},${targetLon.toFixed(4)} body ${rawBody.length}->${outLen}`,
-        };
-    } catch (e) {
-        return fail(`exception ${e?.message ?? e}`);
-    }
-}
+// （移植对照已删除：beta1/beta2 的 transplantWK3NextHourFixed 与东京十六进制常量
+// 见分支历史；beta2 判别已闭合——错在源名而非存在性，填空路线恢复。）
 
-// ---- WK3 NextHour fill (3.4.1-beta8): rebuild slot 5 per PR #108 spec ----
-// PR #108 (patrickyanxxxxx) paired Apple v3 JSON + WK3 FlatBuffer samples:
-// slot 5 = 6 fields [metadata, condition[], summary[], forecastStart, forecastEnd, minutes[]];
-// minute 4 fields (startTime u32, chance u8, intensity f32, perceived f32);
-// summary 5 fields (startTime, endTime, condition BYTE VECTOR, chance u8, intensity f32);
-// condition 6 fields (startTime, endTime, token u8, begin u8, end u8, parameters[]);
-// parameter 2 fields (type u8, date u32). Enums are 1-based (WK3_NH_* tables).
-// beta1–beta6 defects fixed here (§183): summary.condition was a scalar i8 (must be a
-// byte vector); all enums used WK2 0-based values; timeline invariants were not enforced.
-// Fail closed on any unknown enum / broken timeline / multi-condition summary.
+// ---- WK3 NextHour fill (3.4.2-beta3): rebuild slot 5 per PR #108 spec, §189 fixes ----
+// §189 fixes vs beta8: ① attributionUrl truncation (cursor = metaPos + 44, not
+// cursor += 44 after align8) + attributionUrl in the self-check; ② uniform-window
+// token CLEAR=1 -> CONSTANT=6 (no real WK3 table ever showed token 1; Tokyo's
+// uniform-rain window uses CONSTANT=6; the token describes the transition pattern,
+// not the weather); ③ the writer omits default-0 fields, like Apple Builder and
+// the PR encoder (clear summary endTime/chance/intensity, condition endTime=0,
+// every clear minute's chance/intensity/perceived). ④ NOT done: shiftToNow stays
+// anchored to device now — the beta2 transplant's window (same as asOf) was
+// accepted, so the current shift is fine.
+// ①b same-class cursor-walk bug (found by the Case B shape check): every
+// `const X = alignN(cursor); cursor += SIZE` advanced from the PRE-ALIGN cursor;
+// after a 14-byte summary vtable the cursor is 2 mod 4, so the next table landed
+// inside its own vtable (summary[1] vtable f4 entry read 12 instead of 4). All
+// 15 planning lines now advance `cursor = X + SIZE`. (beta8's fill has the same
+// latent bug for the 2nd+ summary; its harness never checked vtable shapes, so it
+// went unnoticed. The single-summary Dalian on-device run was unaffected by it.)
+// Table layout replicates the FlatBuffers Builder exactly (verified against the
+// Tokyo real slot 5: condition [12,0,11,10,9,4]/16, summary [16,0,12,11,4]/20,
+// minute [16,15,8,4]/20). Fields are processed in FIELD ORDER and prepended;
+// a field equal to its default takes no space and its vtable entry is 0.
 function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
     const fail = log => ({ body: null, log: `WK3 nhFill: skipped (${log})` });
     try {
@@ -3075,7 +2820,12 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         for (const c of (nh.condition || [])) {
             const begin = WK3_NH_CONDITION[c.beginCondition];
             const end = WK3_NH_CONDITION[c.endCondition];
-            const token = WK3_NH_TOKEN[c.forecastToken];
+            // §189 fix ②: the provider's "CLEAR" token (uniform clear window,
+            // begin=end=CLEAR) never appears in a real WK3 table (token 1);
+            // Tokyo's uniform-rain window uses CONSTANT=6. The token describes
+            // the transition pattern, not the weather, so a uniform window —
+            // clear or rainy — is CONSTANT=6.
+            const token = c.forecastToken === "CLEAR" ? 6 : WK3_NH_TOKEN[c.forecastToken];
             if (typeof begin !== "number" || typeof end !== "number" || typeof token !== "number") {
                 return fail(`condition enum unsupported: ${c.beginCondition}/${c.endCondition}/${c.forecastToken}`);
             }
@@ -3096,15 +2846,62 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         }
         const align4 = v => Math.ceil(v / 4) * 4;
         const align8 = v => Math.ceil(v / 8) * 8;
+        // ---- Builder table layout (§189 fix ③) ----
+        // fields: [{ size, align, present }] in FIELD ORDER. Returns
+        // { size, offsets } with offsets[i] = offset from table start (0 if absent).
+        // Simulates the Builder's prepend: fields are added in field order, each
+        // aligned up (padding above it), then the 4-byte soffset is written last.
+        const layoutTable = (fields) => {
+            let d = 0;
+            const endDist = new Array(fields.length).fill(0);
+            for (let i = 0; i < fields.length; i++) {
+                const f = fields[i];
+                if (!f.present) continue;
+                d = Math.ceil(d / f.align) * f.align;
+                d += f.size;
+                endDist[i] = d;
+            }
+            d = Math.ceil(d / 4) * 4;
+            const size = d + 4;
+            const offsets = fields.map((f, i) => (f.present ? size - endDist[i] : 0));
+            return { size, offsets };
+        };
+        // Per-table layouts, computed before the cursor walk (sizes vary with
+        // which fields are default-0 and omitted).
+        const condLayouts = conditions.map(c => layoutTable([
+            { size: 4, align: 4, present: true },            // f0 startTime
+            { size: 4, align: 4, present: c.endTime !== 0 }, // f1 endTime
+            { size: 1, align: 1, present: true },            // f2 token
+            { size: 1, align: 1, present: true },            // f3 begin
+            { size: 1, align: 1, present: true },            // f4 end
+            { size: 4, align: 4, present: true },            // f5 parameters vec (always built, even when empty — Tokyo)
+        ]));
+        const summLayouts = summaries.map(s => layoutTable([
+            { size: 4, align: 4, present: true },                          // f0 startTime
+            { size: 4, align: 4, present: s.endTime !== 0 },               // f1 endTime
+            { size: 4, align: 4, present: true },                          // f2 condition byte vec
+            { size: 1, align: 1, present: s.precipitationChance !== 0 },  // f3 chance
+            { size: 4, align: 4, present: s.precipitationIntensity !== 0 }, // f4 intensity
+        ]));
+        const minLayouts = minutes.map(m => layoutTable([
+            { size: 4, align: 4, present: true },                                  // f0 startTime
+            { size: 1, align: 1, present: m.precipitationChance !== 0 },            // f1 chance
+            { size: 4, align: 4, present: m.precipitationIntensity !== 0 },         // f2 intensity
+            { size: 4, align: 4, present: m.perceivedPrecipitationIntensity !== 0 }, // f3 perceived
+        ]));
         // ---- size planning (cursor walk, no writes yet) ----
         const newRootVtablePos = 4;
         const newRootPos = align4(newRootVtablePos + rootVtableLen);
         const newRootTableSize = rootTableSize + 4;
         let cursor = align4(newRootPos + newRootTableSize);
         const nhVtablePos = cursor; cursor += 16;
-        const nhPos = align4(cursor); cursor += 28;
-        const metaVtablePos = align4(cursor); cursor += 26;
-        const metaPos = align8(cursor); cursor += 44;
+        const nhPos = align4(cursor); cursor = nhPos + 28;
+        const metaVtablePos = align4(cursor); cursor = metaVtablePos + 26;
+        // §189 fix ①: cursor must advance from metaPos, not from the pre-align
+        // position — align8 can push the table forward (154 -> 160 here), and the
+        // old `cursor += 44` laid the strings 6 bytes too early, overlapping the
+        // table tail and truncating attributionUrl to "ht".
+        const metaPos = align8(cursor); cursor = metaPos + 44;
         const enc = new TextEncoder();
         const strBytes = {};
         for (const k of ["attributionUrl", "language", "providerLogo", "providerName"]) {
@@ -3114,34 +2911,35 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         for (const k of ["attributionUrl", "language", "providerLogo", "providerName"]) {
             if (strBytes[k]) { strPos[k] = align4(cursor); cursor = strPos[k] + align4(4 + strBytes[k].length); }
         }
-        const condVecPos = align4(cursor); cursor += 4 + 4 * conditions.length;
+        const condVecPos = align4(cursor); cursor = condVecPos + 4 + 4 * conditions.length;
         const condTables = [];
-        for (const c of conditions) {
-            const vt = align4(cursor); cursor += 16;
-            const tp = align4(cursor); cursor += 20;
-            const pv = align4(cursor); cursor += 4 + 4 * c.params.length;
+        for (let i = 0; i < conditions.length; i++) {
+            const c = conditions[i];
+            const vt = align4(cursor); cursor = vt + 16;
+            const tp = align4(cursor); cursor = tp + condLayouts[i].size;
+            const pv = align4(cursor); cursor = pv + 4 + 4 * c.params.length;
             const ptables = [];
             for (let j = 0; j < c.params.length; j++) {
-                const pvt = align4(cursor); cursor += 8;
-                const ptp = align4(cursor); cursor += 12;
+                const pvt = align4(cursor); cursor = pvt + 8;
+                const ptp = align4(cursor); cursor = ptp + 12;
                 ptables.push({ vtable: pvt, table: ptp });
             }
-            condTables.push({ vtable: vt, table: tp, paramsVec: pv, params: c.params, ptables });
+            condTables.push({ vtable: vt, table: tp, paramsVec: pv, params: c.params, ptables, layout: condLayouts[i] });
         }
-        const summVecPos = align4(cursor); cursor += 4 + 4 * summaries.length;
+        const summVecPos = align4(cursor); cursor = summVecPos + 4 + 4 * summaries.length;
         const summTables = [];
         for (let j = 0; j < summaries.length; j++) {
-            const vt = align4(cursor); cursor += 14;
-            const tp = align4(cursor); cursor += 24;
-            const cv = align4(cursor); cursor += 8; // byte vector: [u32 len=1][value][zero pad]
-            summTables.push({ vtable: vt, table: tp, condVec: cv });
+            const vt = align4(cursor); cursor = vt + 14;
+            const tp = align4(cursor); cursor = tp + summLayouts[j].size;
+            const cv = align4(cursor); cursor = cv + 8; // byte vector: [u32 len=1][value][zero pad]
+            summTables.push({ vtable: vt, table: tp, condVec: cv, layout: summLayouts[j] });
         }
-        const minVecPos = align4(cursor); cursor += 4 + 4 * minutes.length;
+        const minVecPos = align4(cursor); cursor = minVecPos + 4 + 4 * minutes.length;
         const minTables = [];
         for (let j = 0; j < minutes.length; j++) {
-            const vt = align4(cursor); cursor += 12;
-            const tp = align4(cursor); cursor += 20;
-            minTables.push({ vtable: vt, table: tp });
+            const vt = align4(cursor); cursor = vt + 12;
+            const tp = align4(cursor); cursor = tp + minLayouts[j].size;
+            minTables.push({ vtable: vt, table: tp, layout: minLayouts[j] });
         }
         const blobOffset = align8(cursor);
         const out = new Uint8Array(blobOffset + rawBody.length);
@@ -3196,22 +2994,21 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         setI32(metaPos + 8, Math.trunc(md.readTime || 0));
         setI32(metaPos + 4, Math.trunc(md.reportedTime || 0));
         setI8(metaPos + 40, sourceType);
-        // ---- condition vector + tables ----
+        // ---- condition vector + tables (default-0 fields omitted per layout) ----
         setU32(condVecPos, conditions.length);
         conditions.forEach((c, i) => {
             const t = condTables[i];
+            const L = t.layout;
             setU32(condVecPos + 4 + i * 4, t.table - (condVecPos + 4 + i * 4));
-            setU16(t.vtable, 16); setU16(t.vtable + 2, 20);
-            setU16(t.vtable + 4 + 0 * 2, 16); setU16(t.vtable + 4 + 1 * 2, 12);
-            setU16(t.vtable + 4 + 2 * 2, 10); setU16(t.vtable + 4 + 3 * 2, 9);
-            setU16(t.vtable + 4 + 4 * 2, 8); setU16(t.vtable + 4 + 5 * 2, 4);
+            setU16(t.vtable, 16); setU16(t.vtable + 2, L.size);
+            for (let f = 0; f < 6; f++) setU16(t.vtable + 4 + f * 2, L.offsets[f]);
             setI32(t.table, t.table - t.vtable);
-            setU32(t.table + 4, t.paramsVec - (t.table + 4));
-            setI8(t.table + 8, c.end);
-            setI8(t.table + 9, c.begin);
-            setI8(t.table + 10, c.token);
-            setI32(t.table + 12, c.endTime);
-            setI32(t.table + 16, c.startTime);
+            setU32(t.table + L.offsets[5], t.paramsVec - (t.table + L.offsets[5]));
+            setI8(t.table + L.offsets[4], c.end);
+            setI8(t.table + L.offsets[3], c.begin);
+            setI8(t.table + L.offsets[2], c.token);
+            if (L.offsets[1]) setI32(t.table + L.offsets[1], c.endTime);
+            setI32(t.table + L.offsets[0], c.startTime);
             setU32(t.paramsVec, t.params.length);
             t.params.forEach((p, j) => {
                 const pt = t.ptables[j];
@@ -3227,36 +3024,35 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         setU32(summVecPos, summaries.length);
         summaries.forEach((s, i) => {
             const t = summTables[i];
+            const L = t.layout;
             setU32(summVecPos + 4 + i * 4, t.table - (summVecPos + 4 + i * 4));
-            setU16(t.vtable, 14); setU16(t.vtable + 2, 24);
-            setU16(t.vtable + 4 + 0 * 2, 20); setU16(t.vtable + 4 + 1 * 2, 16);
-            setU16(t.vtable + 4 + 2 * 2, 12); setU16(t.vtable + 4 + 3 * 2, 8);
-            setU16(t.vtable + 4 + 4 * 2, 4);
+            setU16(t.vtable, 14); setU16(t.vtable + 2, L.size);
+            for (let f = 0; f < 5; f++) setU16(t.vtable + 4 + f * 2, L.offsets[f]);
             setI32(t.table, t.table - t.vtable);
-            setF32(t.table + 4, s.precipitationIntensity);
-            setI8(t.table + 8, s.precipitationChance);
-            setU32(t.table + 12, t.condVec - (t.table + 12));
-            setI32(t.table + 16, s.endTime);
-            setI32(t.table + 20, s.startTime);
+            if (L.offsets[4]) setF32(t.table + L.offsets[4], s.precipitationIntensity);
+            if (L.offsets[3]) setI8(t.table + L.offsets[3], s.precipitationChance);
+            setU32(t.table + L.offsets[2], t.condVec - (t.table + L.offsets[2]));
+            if (L.offsets[1]) setI32(t.table + L.offsets[1], s.endTime);
+            setI32(t.table + L.offsets[0], s.startTime);
             // byte vector: [u32 len=1][value][zero] — zero padding keeps it readable
             // as u8 and as u16 (PR #108 singleton note).
             setU32(t.condVec, 1);
             setU8(t.condVec + 4, s.condition);
             setU8(t.condVec + 5, 0);
         });
-        // ---- minutes vector + tables ----
+        // ---- minutes vector + tables (default-0 fields omitted per layout) ----
         setU32(minVecPos, minutes.length);
         minutes.forEach((m, i) => {
             const t = minTables[i];
+            const L = t.layout;
             setU32(minVecPos + 4 + i * 4, t.table - (minVecPos + 4 + i * 4));
-            setU16(t.vtable, 12); setU16(t.vtable + 2, 20);
-            setU16(t.vtable + 4 + 0 * 2, 16); setU16(t.vtable + 4 + 1 * 2, 12);
-            setU16(t.vtable + 4 + 2 * 2, 8); setU16(t.vtable + 4 + 3 * 2, 4);
+            setU16(t.vtable, 12); setU16(t.vtable + 2, L.size);
+            for (let f = 0; f < 4; f++) setU16(t.vtable + 4 + f * 2, L.offsets[f]);
             setI32(t.table, t.table - t.vtable);
-            setF32(t.table + 4, m.perceivedPrecipitationIntensity);
-            setF32(t.table + 8, m.precipitationIntensity);
-            setI8(t.table + 12, m.precipitationChance);
-            setI32(t.table + 16, m.startTime);
+            if (L.offsets[3]) setF32(t.table + L.offsets[3], m.perceivedPrecipitationIntensity);
+            if (L.offsets[2]) setF32(t.table + L.offsets[2], m.precipitationIntensity);
+            if (L.offsets[1]) setI8(t.table + L.offsets[1], m.precipitationChance);
+            setI32(t.table + L.offsets[0], m.startTime);
         });
         // ---- blob ----
         out.set(rawBody, blobOffset);
@@ -3281,6 +3077,16 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
             chkProv = new TextDecoder().decode(out.subarray(sp + 4, sp + 4 + slen));
         }
         if (chkProv !== (md.providerName || "")) return fail("self-check providerName mismatch");
+        // §189 fix ①: attributionUrl full comparison (beta8 truncated it to "ht"
+        // and the self-check never noticed — it only covered providerName/lat/lon).
+        const chkUrlOff = chk.__offset(chkMeta, 4);
+        let chkUrl = "";
+        if (chkUrlOff) {
+            const sp = chk.__indirect(chkMeta + chkUrlOff);
+            const slen = chk.readUint32(sp);
+            chkUrl = new TextDecoder().decode(out.subarray(sp + 4, sp + 4 + slen));
+        }
+        if (chkUrl !== (md.attributionUrl || "")) return fail("self-check attributionUrl mismatch");
         const chkLatOff = chk.__offset(chkMeta, 10);
         const chkLonOff = chk.__offset(chkMeta, 12);
         if (!chkLatOff || !chkLonOff) return fail("self-check meta lat/lon absent");
@@ -3320,9 +3126,44 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
                 return fail(`self-check summary ${i} condition vector`);
             }
         }
+        // §189 fix ③: default-0 fields must be omitted (vtable entry 0), not
+        // written as zero. Check each table's vtable against the expected presence.
+        const vtEntry = (tablePos, field) => {
+            const vt = tablePos - chk.readInt32(tablePos);
+            const vlen = chk.readUint16(vt);
+            return (4 + field * 2 < vlen) ? chk.readUint16(vt + 4 + field * 2) : 0;
+        };
+        for (let i = 0; i < summaries.length; i++) {
+            const slot = chkSummVec + 4 + i * 4;
+            const st = slot + chk.readUint32(slot);
+            const s = summaries[i];
+            const want = [true, s.endTime !== 0, true, s.precipitationChance !== 0, s.precipitationIntensity !== 0];
+            for (let f = 0; f < 5; f++) {
+                if ((vtEntry(st, f) !== 0) !== want[f]) return fail(`self-check summary ${i} field ${f} omission`);
+            }
+        }
+        const chkCondVec = chk.__indirect(chkNh + chkCondOff);
+        for (let i = 0; i < conditions.length; i++) {
+            const slot = chkCondVec + 4 + i * 4;
+            const ct = slot + chk.readUint32(slot);
+            const c = conditions[i];
+            const want = [true, c.endTime !== 0, true, true, true, true];
+            for (let f = 0; f < 6; f++) {
+                if ((vtEntry(ct, f) !== 0) !== want[f]) return fail(`self-check condition ${i} field ${f} omission`);
+            }
+        }
+        for (let i = 0; i < minutes.length; i++) {
+            const slot = chkMinVec + 4 + i * 4;
+            const mt = slot + chk.readUint32(slot);
+            const m = minutes[i];
+            const want = [true, m.precipitationChance !== 0, m.precipitationIntensity !== 0, m.perceivedPrecipitationIntensity !== 0];
+            for (let f = 0; f < 4; f++) {
+                if ((vtEntry(mt, f) !== 0) !== want[f]) return fail(`self-check minute ${i} field ${f} omission`);
+            }
+        }
         return {
             body: out,
-            log: `WK3 nhFill: slot 5 created (beta8 PR#108 spec${opts.shiftToNow ? " shiftToNow" : ""}) minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
+            log: `WK3 nhFill: slot 5 created (beta3 §189 fixes${opts.shiftToNow ? " shiftToNow" : ""}) minutes=${minutes.length} summaries=${summaries.length} conditions=${conditions.length} provider=${md.providerName || "?"} body ${rawBody.length}->${out.length}`,
         };
     } catch (e) {
         return { body: null, log: `WK3 nhFill: skipped (exception ${e?.message ?? e})` };
