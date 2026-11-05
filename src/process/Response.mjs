@@ -1072,7 +1072,10 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
         const newRootVtablePos = 4;
         const newRootPos = align4(newRootVtablePos + rootVtableLen);
         const newCollVtablePos = align4(newRootPos + rootTableSize);
-        const newCollPos = newCollVtablePos + collVtableLen;
+        // 集合表含 uoffset（4 字节），表位必须 4 对齐：beta8 漏了这
+        // 一步，表落在 90（%4=2），App 验不过整条响应（哈尔滨/
+        // 中山 AQ 连带消失；无预警城市不走这步故不受影响）。
+        const newCollPos = align4(newCollVtablePos + collVtableLen);
         const newVecPos = align4(newCollPos + collTableSize);
         const newVecSize = 4 + alertCount * 4;
         let cursor = align4(newVecPos + newVecSize);
@@ -1080,13 +1083,14 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
         for (let i = 0; i < alertCount; i++) {
             const plan = elemPlans[i];
             if (!plan) { elemNewPos.push(null); continue; }
-            const vtablePos = cursor;
-            cursor += elemInfos[i].elemVtableLen;
-            const tablePos = cursor;
-            cursor += plan.newTableSize;
+            const vtablePos = align4(cursor);
+            cursor = vtablePos + elemInfos[i].elemVtableLen;
+            const tablePos = align4(cursor);
+            cursor = tablePos + plan.newTableSize;
             elemNewPos.push({ vtablePos, tablePos, plan });
         }
         const strPos = new Map(); // "i:f" -> pos
+        cursor = align4(cursor);
         for (let i = 0; i < alertCount; i++) {
             const plan = elemPlans[i];
             if (!plan) continue;
@@ -1096,6 +1100,7 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
             }
         }
         const respPos = new Map(); // i -> pos
+        cursor = align4(cursor);
         for (let i = 0; i < alertCount; i++) {
             const plan = elemPlans[i];
             if (!plan || !plan.newRespSize) continue;
