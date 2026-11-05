@@ -1044,14 +1044,21 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
                 elemPlans.push(null);
                 continue;
             }
-            // 缺席字段的追加：先 int32（4 对齐），后 int8（1 对齐）。
+            // 缺席字段的追加：先 4 字节槽（int32 时间与串 uoffset，
+            // 均需 4 对齐），后 int8 枚举（1 对齐）。串字段缺席时也
+            // 在此配一个 4 字节槽位放新串的 uoffset（beta7 漏了这一
+            // 类：和风详情页映射会给每条预警补 areaId/areaName，
+            // 苹果原体这两字段缺席，缺槽位就写不进，beta8 补上）。
             const added = new Map(); // field -> offset in new table
             let cursor = info.elemTableSize;
             const addedInt32 = [];
+            const addedStr = [];
             const addedInt8 = [];
             for (const [f] of ch.times) if (!info.foffs[f]) addedInt32.push(f);
+            for (const [f] of ch.strings) if (!info.foffs[f]) addedStr.push(f);
             for (const [f] of ch.enums) if (!info.foffs[f]) addedInt8.push(f);
             for (const f of addedInt32) { cursor = Math.ceil(cursor / 4) * 4; added.set(f, cursor); cursor += 4; }
+            for (const f of addedStr) { cursor = Math.ceil(cursor / 4) * 4; added.set(f, cursor); cursor += 4; }
             for (const f of addedInt8) { added.set(f, cursor); cursor += 1; }
             const newTableSize = cursor;
             const newStrings = [];
@@ -1162,11 +1169,11 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
                 const fieldOff = info.foffs[f];
                 if (!fieldOff && !ch.strings.has(f) && f !== 21) continue;
                 if (ch.strings.has(f)) {
-                    // 新串字段若原先缺席则跳过（beta7 只改已存在的串字段，
-                    // 如 description；缺席串字段的表扩展留给后续 beta）。
-                    if (!fieldOff) continue;
+                    // 已存在字段改写原槽位；缺席字段用扩展区的新槽位。
+                    const slotOff = fieldOff || plan.added.get(f);
+                    if (slotOff == null) continue;
                     const sPos = strPos.get(`${i}:${f}`);
-                    setU32(np.tablePos + fieldOff, sPos - (np.tablePos + fieldOff));
+                    setU32(np.tablePos + slotOff, sPos - (np.tablePos + slotOff));
                 } else if (f === 21 && ch.responses) {
                     const rPos = respPos.get(i);
                     setU32(np.tablePos + fieldOff, rPos - (np.tablePos + fieldOff));
