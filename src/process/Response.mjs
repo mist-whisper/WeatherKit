@@ -1244,14 +1244,39 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
         const vecPos = ByteBuffer.__indirect(collPos + collAlertsOffset);
         const alertCount = ByteBuffer.readInt32(vecPos);
         if (alertCount <= 0 || alertCount > 64) return { body: null, log: `WK3 alerts: skipped (alert count ${alertCount})` };
-        // provider：本 beta 只接 QWeatherWeb（默认路径）。
+        // provider 分发（v2 InjectWeatherAlerts 同款规则）：
+        // QWeatherWeb 恒跑；ColorfulClouds / QWeather 只在国家预警
+        // 中心城市跑（v2 的 NWC 门：两家预警数据只覆盖国内）。
         const providerName = Settings?.WeatherAlerts?.Provider || "QWeatherWeb";
         if (providerName === "WeatherKit") return { body: null, log: "WK3 alerts: skipped (provider WeatherKit)" };
-        if (providerName !== "QWeatherWeb") return { body: null, log: `WK3 alerts: skipped (provider ${providerName} not wired in WK3)` };
-        const detailsUrl = collDetailsOffset ? ByteBuffer.__string(collPos + collDetailsOffset) : "";
-        if (!detailsUrl) return { body: null, log: "WK3 alerts: skipped (no detailsUrl)" };
-        const qWeather = new QWeather({ ...parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host);
-        const providerResult = await qWeather.WeatherAlertWeb(detailsUrl);
+        let collProviderName = "";
+        if (collMetaOffset) {
+            const metaPos = ByteBuffer.__indirect(collPos + collMetaOffset);
+            const metaProviderOffset = ByteBuffer.__offset(metaPos, 16);
+            if (metaProviderOffset) collProviderName = ByteBuffer.__string(metaPos + metaProviderOffset) || "";
+        }
+        const isNationalWarningCenter = ["国家预警信息发布中心", "國家預警信息發布中心", "National Early Warning Center"].includes(collProviderName);
+        let providerResult;
+        if (providerName === "QWeatherWeb") {
+            const detailsUrl = collDetailsOffset ? ByteBuffer.__string(collPos + collDetailsOffset) : "";
+            if (!detailsUrl) return { body: null, log: "WK3 alerts: skipped (no detailsUrl)" };
+            const qWeather = new QWeather({ ...parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host);
+            providerResult = await qWeather.WeatherAlertWeb(detailsUrl);
+        } else if (providerName === "ColorfulClouds" || providerName === "QWeather") {
+            if (!isNationalWarningCenter) return { body: null, log: `WK3 alerts: skipped (provider ${providerName} requires National Warning Center, got "${collProviderName}")` };
+            if (providerName === "ColorfulClouds") {
+                // v2 同款：WeatherAlert()（v2.6 实况缓存）；不用
+                // WeatherAlertV3CAP()（另条 CAP 端点，v2 未接）。
+                const colorfulClouds = new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ==");
+                providerResult = await colorfulClouds.WeatherAlert();
+            } else {
+                // 和风 weatheralert v1：/weatheralert/v1/current/{lat}/{lon}。
+                const qWeather = new QWeather({ ...parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host);
+                providerResult = await qWeather.WeatherAlert();
+            }
+        } else {
+            return { body: null, log: `WK3 alerts: skipped (provider ${providerName} not wired in WK3)` };
+        }
         const providerAlerts = providerResult?.alerts || [];
         if (!providerAlerts.length) return { body: null, log: "WK3 alerts: skipped (no provider alerts)" };
         // 枚举表（与 3.2 bundle 生成对象一致；解码 int→串，编码串→int）。
@@ -1577,7 +1602,7 @@ async function supplementWK3Alerts(ByteBuffer, rawBody, parameters, Settings) {
             if (ch.responses) parts.push(`responses=[${appleAlerts[i].responses.join(",")}]`);
             filledDesc.push(`alert${i}(${parts.join(",")})`);
         }
-        return { body: out, log: `WK3 alerts: QWeatherWeb ${alertCount} alerts, ${providerAlerts.length} provider alerts, filled ${filledDesc.join("; ")} body ${rawBody.length}->${out.length}` };
+        return { body: out, log: `WK3 alerts: ${providerName} ${alertCount} alerts, ${providerAlerts.length} provider alerts, filled ${filledDesc.join("; ")} body ${rawBody.length}->${out.length}` };
     } catch (error) {
         return { body: null, log: `WK3 alerts: skipped (${error?.message ?? error})` };
     }
