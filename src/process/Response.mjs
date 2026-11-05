@@ -117,18 +117,27 @@ export async function Response($request, $response) {
                                     }
                                 }
                                 // AQ 全套（跟随设置）：用原污染物按设置的算法算指数，一起换
-                                // category / index / 主污染物 / scale 串；昨日对比在原值
-                                // UNKNOWN（或 ReplaceWhenCurrentChange）时按 v2 逻辑重算
-                                // （默认走彩云昨日/今日美标或国标对比），元数据拼接
-                                // providerName；污染物空了不补（先只做污染物本来就有
-                                // 的城市）；对比或元数据任一失败只退回原值，不影响
-                                // 指数替换与 CW。国家门跟 Weather.Replace，scale 门跟
+                                // category / index / 主污染物 / scale 串；v3.4.1-beta6
+                                // 起四条合做：污染物空了按 Pollutants.Provider 补填、
+                                // 指数按 Index.Provider 直取（和风/彩云美标/彩云国标/
+                                // WAQI，默认仍为内置 Calculate）、昨日对比接和风与
+                                // 内置算法；付费/令牌路径只留设置接口（上游同款），
+                                // 不在代码里另行写死。和风与 WAQI 的实例在
+                                // calculateWK3AQ 内按需建。昨日对比在原值 UNKNOWN
+                                // （或 ReplaceWhenCurrentChange）时按 v2 逻辑重算，
+                                // 元数据拼接 providerName；对比或元数据任一失败只
+                                // 退回原值，不影响指数替换与 CW。国家门跟
+                                // Weather.Replace，scale 门跟
                                 // AirQuality.Current.Index.Replace。
-                                let aqComparisonEnv = null;
+                                let aqEnv = null;
                                 if (Settings?.Weather?.Replace?.includes(parameters.country)) {
-                                    aqComparisonEnv = new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ==");
+                                    aqEnv = {
+                                        parameters,
+                                        caches: Caches,
+                                        colorfulClouds: new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ=="),
+                                    };
                                 }
-                                const aqReplace = await calculateWK3AQ(ByteBuffer, rawBody, parameters.country, Settings, aqComparisonEnv);
+                                const aqReplace = await calculateWK3AQ(ByteBuffer, rawBody, parameters.country, Settings, aqEnv);
                                 let workingBody = rawBody;
                                 let workingByteBuffer = ByteBuffer;
                                 if (aqReplace.body) {
@@ -344,10 +353,23 @@ export async function Response($request, $response) {
  * @param {any} Settings - 插件 Settings
  * @returns {{body: Uint8Array | null, log: string}}
  */
-async function calculateWK3AQ(ByteBuffer, rawBody, country, Settings, colorfulClouds = null) {
+async function calculateWK3AQ(ByteBuffer, rawBody, country, Settings, aqEnv = null) {
     try {
         const replaceCountries = Settings?.Weather?.Replace ?? ["CN"];
         if (!replaceCountries.includes(country)) return { body: null, log: `WK3 aq: skipped (country ${country} not in Weather.Replace)` };
+        // 和风与 WAQI 实例按需建（只在选到相关 provider 时才建，
+        // 避免每次请求都多打日志）；token 一律走 Settings 接口。
+        const colorfulClouds = aqEnv?.colorfulClouds ?? null;
+        const getQWeather = () => {
+            if (!aqEnv) return null;
+            if (!aqEnv.qWeather) aqEnv.qWeather = new QWeather({ ...aqEnv.parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host);
+            return aqEnv.qWeather;
+        };
+        const getWAQI = () => {
+            if (!aqEnv) return null;
+            if (!aqEnv.waqi) aqEnv.waqi = new WAQI(aqEnv.parameters, Settings?.API?.WAQI?.Token);
+            return aqEnv.waqi;
+        };
         const algorithm = Settings?.AirQuality?.Calculate?.Algorithm ?? "EU_EAQI";
         if (algorithm === "None") return { body: null, log: "WK3 aq: skipped (algorithm None)" };
         const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
@@ -379,12 +401,32 @@ async function calculateWK3AQ(ByteBuffer, rawBody, country, Settings, colorfulCl
         const vecPos = ByteBuffer.__indirect(aqPos + aqPollutantsOffset);
         if (vecPos < 0 || vecPos + 4 > rawBody.length) return { body: null, log: "WK3 aq: skipped (pollutants vector out of range)" };
         const vecLen = ByteBuffer.readInt32(vecPos);
-        if (vecLen <= 0 || vecLen > 20) return { body: null, log: `WK3 aq: skipped (pollutants empty or too many: ${vecLen})` };
+        if (vecLen > 20) return { body: null, log: `WK3 aq: skipped (pollutants too many: ${vecLen})` };
         const pollutantTypes = ["NOT_AVAILABLE", "C6H6", "NH3", "NMHC", "NO", "NO2", "NOX", "OZONE", "PM2_5", "SO2", "PM10", "CO", "UNKNOWN12", "UNKNOWN13"];
         // WK2 的单位枚举：0 ppb、1 µg、2 UNKNOWN2、3 UNKNOWN3。WK3 原包体里
         // 大量出现单位字节 2，且浓度是 µg 量级，故计算时把它当作微克（推断，见函数注释）。
         const unitTypes = ["PARTS_PER_BILLION", "MICROGRAMS_PER_CUBIC_METER", "MICROGRAMS_PER_CUBIC_METER", "UNKNOWN3"];
-        const pollutants = [];
+        const unitEnumByName = { PARTS_PER_BILLION: 0, MICROGRAMS_PER_CUBIC_METER: 1, UNKNOWN3: 3 };
+        // 污染物空了（v2 Step 2）：按 Pollutants.Provider 补填；补不到则跳过。
+        // 槽位本身缺失时上游已在前面拦下（AQ field absent），此处只处理空向量。
+        let filledPollutants = null;
+        let filledProviderName = null;
+        if (vecLen === 0) {
+            const pollutantsProvider = Settings?.AirQuality?.Current?.Pollutants?.Provider ?? "ColorfulClouds";
+            try {
+                const filled = pollutantsProvider === "QWeather"
+                    ? await getQWeather()?.CurrentAirQuality()
+                    : await colorfulClouds?.CurrentAirQuality();
+                if (filled && !filled.metadata?.temporarilyUnavailable && Array.isArray(filled.pollutants) && filled.pollutants.length > 0) {
+                    filledPollutants = filled.pollutants;
+                    filledProviderName = filled.metadata?.providerName || pollutantsProvider;
+                }
+            } catch {
+                filledPollutants = null;
+            }
+            if (!filledPollutants) return { body: null, log: `WK3 aq: skipped (pollutants empty, provider ${pollutantsProvider} unavailable)` };
+        }
+        let pollutants = [];
         const origPollutants = [];
         for (let i = 0; i < vecLen; i++) {
             const elemPos = ByteBuffer.__indirect(vecPos + 4 + i * 4);
@@ -399,37 +441,90 @@ async function calculateWK3AQ(ByteBuffer, rawBody, country, Settings, colorfulCl
             pollutants.push({ pollutantType: pollutantTypes[typeByte] ?? "UNKNOWN", amount, units: unitTypes[unitsByte] ?? "UNKNOWN" });
             origPollutants.push({ typeByte, amount, unitsByte, units: unitTypes[unitsByte] ?? "UNKNOWN" });
         }
-        const effectiveSettings = {
-            ...Settings,
-            AirQuality: { ...(Settings?.AirQuality ?? {}), Calculate: { ...(Settings?.AirQuality?.Calculate ?? {}), Algorithm: algorithm } },
-        };
-        const calculated = AirQuality.Pollutants2AQI({ pollutants, metadata: { providerName } }, effectiveSettings);
+        if (filledPollutants) {
+            // 补填的污染物只留类型/单位已知、量有限且非负的项（provider
+            // 缺失值常以 -1 占位，需滤掉）；单位串须在 overlay 可写枚举内。
+            pollutants = filledPollutants
+                .filter(p => pollutantTypes.includes(p.pollutantType) && unitEnumByName[p.units] !== undefined && Number.isFinite(p.amount) && p.amount >= 0)
+                .map(p => ({ pollutantType: p.pollutantType, amount: p.amount, units: p.units }));
+            if (pollutants.length === 0) return { body: null, log: "WK3 aq: skipped (pollutants filled but unusable)" };
+        }
+        // 指数来源按 Index.Provider 分发（v2 InjectIndex 同款）；默认
+        // 仍为内置 Calculate。直接 provider 的结果须自带 scale /
+        // category / index / 主污染物 / isSignificant / pollutants /
+        // metadata；WAQI 不带 pollutants，向量保持原样。
+        const indexProvider = Settings?.AirQuality?.Current?.Index?.Provider ?? "Calculate";
+        const forceCNPrimary = Settings?.AirQuality?.Current?.Index?.ForceCNPrimaryPollutants;
+        let calculated = null;
+        if (indexProvider === "QWeather") {
+            const qw = getQWeather();
+            const direct = qw ? await qw.CurrentAirQuality(forceCNPrimary) : null;
+            if (!direct || direct.metadata?.temporarilyUnavailable) return { body: null, log: "WK3 aq: skipped (QWeather index unavailable)" };
+            calculated = direct;
+        } else if (indexProvider === "ColorfulCloudsUS" || indexProvider === "ColorfulCloudsCN") {
+            if (!colorfulClouds) return { body: null, log: "WK3 aq: skipped (no colorfulClouds env)" };
+            const direct = await colorfulClouds.CurrentAirQuality(indexProvider === "ColorfulCloudsUS", forceCNPrimary);
+            if (!direct || direct.metadata?.temporarilyUnavailable) return { body: null, log: `WK3 aq: skipped (${indexProvider} index unavailable)` };
+            calculated = direct;
+        } else if (indexProvider === "WAQI") {
+            const waqi = getWAQI();
+            if (!waqi) return { body: null, log: "WK3 aq: skipped (no WAQI env)" };
+            let direct = null;
+            if (Settings?.API?.WAQI?.Token) {
+                direct = await waqi.AQI2();
+            } else {
+                const nearest = await waqi.Nearest();
+                if (nearest?.metadata?.stationId) {
+                    const token = await waqi.Token(nearest.metadata.stationId);
+                    const aqi = token ? await waqi.AQI(nearest.metadata.stationId, token) : null;
+                    if (aqi) direct = { metadata: { ...nearest.metadata, ...aqi.metadata }, ...nearest, ...aqi };
+                }
+            }
+            if (!direct || direct.metadata?.temporarilyUnavailable) return { body: null, log: "WK3 aq: skipped (WAQI index unavailable)" };
+            calculated = direct;
+        } else {
+            const effectiveSettings = {
+                ...Settings,
+                AirQuality: { ...(Settings?.AirQuality ?? {}), Calculate: { ...(Settings?.AirQuality?.Calculate ?? {}), Algorithm: algorithm } },
+            };
+            calculated = AirQuality.Pollutants2AQI({ pollutants, metadata: { providerName } }, effectiveSettings);
+        }
         if (!Number.isFinite(calculated?.index) || calculated.index < 0 || !Number.isFinite(calculated?.categoryIndex) || calculated.categoryIndex < 1 || calculated.categoryIndex > 10) {
-            return { body: null, log: `WK3 aq: skipped (calculation invalid: index=${calculated?.index} category=${calculated?.categoryIndex})` };
+            return { body: null, log: `WK3 aq: skipped (index invalid: index=${calculated?.index} category=${calculated?.categoryIndex})` };
         }
         const primaryEnum = pollutantTypes.indexOf(calculated.primaryPollutant);
         if (primaryEnum < 0) return { body: null, log: `WK3 aq: skipped (primary pollutant unknown: ${calculated.primaryPollutant})` };
         const perPollutant = (calculated.pollutants ?? []).map(p => `${p.pollutantType}=${Number.isFinite(p.index) ? p.index.toFixed(2) : p.index}`).join(" ");
-        // 污染物向量重建输入：按原顺序、按类型对齐计算结果；量或单位串
-        // 没变的写回原字节（见函数注释），变了的写换算值与目标单位枚举。
-        const unitEnumByName = { PARTS_PER_BILLION: 0, MICROGRAMS_PER_CUBIC_METER: 1, UNKNOWN3: 3 };
+        // 污染物向量重建输入：按原顺序、按类型对齐指数结果；量或单位
+        // 没变的写回原字节，变了的写换算值与目标单位枚举。空向量补填
+        // 时没有原表，直接用指数结果的污染物建新向量（overlay 的
+        // fresh 分支）。
         const calcByType = new Map((calculated.pollutants ?? []).map(p => [p.pollutantType, p]));
-        const newPollutants = origPollutants.map(orig => {
-            const typeName = pollutantTypes[orig.typeByte] ?? "UNKNOWN";
-            const calc = calcByType.get(typeName);
-            const unchanged = { typeEnum: orig.typeByte, amount: orig.amount, unitsEnum: orig.unitsByte };
-            if (!calc || !Number.isFinite(calc.amount) || calc.amount < 0) return unchanged;
-            if (calc.amount === orig.amount && calc.units === orig.units) return unchanged;
-            const unitsEnum = unitEnumByName[calc.units];
-            if (!Number.isInteger(unitsEnum)) return unchanged;
-            return { typeEnum: orig.typeByte, amount: calc.amount, unitsEnum };
-        });
-        const changedDesc = newPollutants.map((p, i) => {
-            const orig = origPollutants[i];
-            if (p.amount === orig.amount && p.unitsEnum === orig.unitsByte) return null;
-            const unitLabel = p.unitsEnum === 0 ? "ppb" : p.unitsEnum === 1 ? "µg" : `byte${p.unitsEnum}`;
-            return `${pollutantTypes[orig.typeByte] ?? "?"} ${orig.amount}->${Number(p.amount.toFixed(2))}${unitLabel}`;
-        }).filter(Boolean).join(", ");
+        let newPollutants;
+        let changedDesc;
+        if (origPollutants.length > 0) {
+            newPollutants = origPollutants.map(orig => {
+                const typeName = pollutantTypes[orig.typeByte] ?? "UNKNOWN";
+                const calc = calcByType.get(typeName);
+                const unchanged = { typeEnum: orig.typeByte, amount: orig.amount, unitsEnum: orig.unitsByte };
+                if (!calc || !Number.isFinite(calc.amount) || calc.amount < 0) return unchanged;
+                if (calc.amount === orig.amount && calc.units === orig.units) return unchanged;
+                const unitsEnum = unitEnumByName[calc.units];
+                if (!Number.isInteger(unitsEnum)) return unchanged;
+                return { typeEnum: orig.typeByte, amount: calc.amount, unitsEnum };
+            });
+            changedDesc = newPollutants.map((p, i) => {
+                const orig = origPollutants[i];
+                if (p.amount === orig.amount && p.unitsEnum === orig.unitsByte) return null;
+                const unitLabel = p.unitsEnum === 0 ? "ppb" : p.unitsEnum === 1 ? "µg" : `byte${p.unitsEnum}`;
+                return `${pollutantTypes[orig.typeByte] ?? "?"} ${orig.amount}->${Number(p.amount.toFixed(2))}${unitLabel}`;
+            }).filter(Boolean).join(", ");
+        } else {
+            newPollutants = (calculated.pollutants ?? [])
+                .filter(p => pollutantTypes.includes(p.pollutantType) && unitEnumByName[p.units] !== undefined && Number.isFinite(p.amount) && p.amount >= 0)
+                .map(p => ({ typeEnum: pollutantTypes.indexOf(p.pollutantType), amount: p.amount, unitsEnum: unitEnumByName[p.units] }));
+            changedDesc = `filled ${newPollutants.length} pollutants`;
+        }
         // WK3 探针（beta12）：beta11 已证实应用不发定义请求，故“定义送达”说已排除；
         // 剩余名字格式假说：WK3 体内苹果自带 scale 均带版本后缀（HJ6332012.2604、
         // EPA_NowCast.2604），而 HK.AQHI 本地定义的 version 为 1，故试写带版本的
@@ -452,53 +547,118 @@ async function calculateWK3AQ(ByteBuffer, rawBody, country, Settings, colorfulCl
         let comparisonLine = null;
         let comparisonLog = "comparison unchanged";
         if (needComputeComparison) {
-            // 默认昨日指数源为 ColorfulCloudsUS；国标源为 ColorfulCloudsCN；
-            // 其余昨日源（QWeather/Calculate）在 WK3 暂不接线，失败只退回原值。
+            // 昨日指数源按 v2 InjectComparison 分发：彩云美标/国标、
+            // 和风、内置算法（和风昨日污染物 + 本地算）。失败只退回原值。
             const yesterdayProvider = Settings?.AirQuality?.Comparison?.Yesterday?.IndexProvider ?? "ColorfulCloudsUS";
-            const useUsa = yesterdayProvider !== "ColorfulCloudsCN";
-            if (!colorfulClouds) {
-                comparisonLog = "comparison skipped (no colorfulClouds env)";
-            } else if (yesterdayProvider !== "ColorfulCloudsUS" && yesterdayProvider !== "ColorfulCloudsCN") {
-                comparisonLog = `comparison skipped (yesterday provider ${yesterdayProvider} not wired in WK3)`;
-            } else {
-                try {
-                    const currentIndexProvider = Settings?.AirQuality?.Current?.Index?.Provider ?? "Calculate";
-                    const isHj = currentIndexProvider === "Calculate"
-                        ? Settings?.AirQuality?.Calculate?.Algorithm === "WAQI_InstantCast_CN"
-                        : (currentIndexProvider === "QWeather" || currentIndexProvider === "ColorfulCloudsCN");
-                    const isEpa = currentIndexProvider === "WAQI" || currentIndexProvider === "ColorfulCloudsUS";
-                    const todayCatFromInjected = yesterdayProvider === "ColorfulCloudsCN" ? (isHj ? calculated.categoryIndex : undefined) : (isEpa ? calculated.categoryIndex : undefined);
-                    const yesterday = await colorfulClouds.YesterdayAirQuality(useUsa);
-                    if (yesterday?.metadata?.temporarilyUnavailable || !Number.isFinite(yesterday?.categoryIndex)) {
-                        comparisonLog = "comparison skipped (yesterday unavailable)";
-                    } else {
-                        let todayCat = todayCatFromInjected;
-                        if (todayCat === undefined) {
-                            const ccCurrent = await colorfulClouds.CurrentAirQuality(useUsa);
-                            if (ccCurrent?.metadata?.temporarilyUnavailable || !Number.isFinite(ccCurrent?.categoryIndex)) {
-                                comparisonLog = "comparison skipped (current unavailable)";
-                                todayCat = null;
-                            } else {
-                                todayCat = ccCurrent.categoryIndex;
+            const currentIndexProvider = Settings?.AirQuality?.Current?.Index?.Provider ?? "Calculate";
+            const isHj = currentIndexProvider === "Calculate"
+                ? Settings?.AirQuality?.Calculate?.Algorithm === "WAQI_InstantCast_CN"
+                : (currentIndexProvider === "QWeather" || currentIndexProvider === "ColorfulCloudsCN");
+            const isEpa = currentIndexProvider === "WAQI" || currentIndexProvider === "ColorfulCloudsUS";
+            if (yesterdayProvider === "ColorfulCloudsUS" || yesterdayProvider === "ColorfulCloudsCN") {
+                const useUsa = yesterdayProvider !== "ColorfulCloudsCN";
+                if (!colorfulClouds) {
+                    comparisonLog = "comparison skipped (no colorfulClouds env)";
+                } else {
+                    try {
+                        const todayCatFromInjected = yesterdayProvider === "ColorfulCloudsCN" ? (isHj ? calculated.categoryIndex : undefined) : (isEpa ? calculated.categoryIndex : undefined);
+                        const yesterday = await colorfulClouds.YesterdayAirQuality(useUsa);
+                        if (yesterday?.metadata?.temporarilyUnavailable || !Number.isFinite(yesterday?.categoryIndex)) {
+                            comparisonLog = "comparison skipped (yesterday unavailable)";
+                        } else {
+                            let todayCat = todayCatFromInjected;
+                            if (todayCat === undefined) {
+                                const ccCurrent = await colorfulClouds.CurrentAirQuality(useUsa);
+                                if (ccCurrent?.metadata?.temporarilyUnavailable || !Number.isFinite(ccCurrent?.categoryIndex)) {
+                                    comparisonLog = "comparison skipped (current unavailable)";
+                                    todayCat = null;
+                                } else {
+                                    todayCat = ccCurrent.categoryIndex;
+                                }
+                            }
+                            if (todayCat !== undefined && todayCat !== null) {
+                                const trend = AirQuality.CompareCategoryIndexes(todayCat, yesterday.categoryIndex);
+                                comparisonByte = COMPARISON_BYTE_BY_TREND[trend] ?? 0;
+                                comparisonLine = `对比昨日：\n指数：${AirQuality.appendScaleToProviderName({ metadata: yesterday.metadata, scale: yesterday.scale }, Settings)}`;
+                                comparisonLog = `comparison ${origComparisonStr}->${trend} (CC today ${todayCat} vs yesterday ${yesterday.categoryIndex})`;
                             }
                         }
-                        if (todayCat !== undefined && todayCat !== null) {
-                            const trend = AirQuality.CompareCategoryIndexes(todayCat, yesterday.categoryIndex);
-                            comparisonByte = COMPARISON_BYTE_BY_TREND[trend] ?? 0;
-                            comparisonLine = `对比昨日：\n指数：${AirQuality.appendScaleToProviderName({ metadata: yesterday.metadata, scale: yesterday.scale }, Settings)}`;
-                            comparisonLog = `comparison ${origComparisonStr}->${trend} (CC today ${todayCat} vs yesterday ${yesterday.categoryIndex})`;
+                    } catch (error) {
+                        comparisonLog = `comparison skipped (${error?.message ?? error})`;
+                    }
+                }
+            } else if (yesterdayProvider === "QWeather" || yesterdayProvider === "Calculate") {
+                try {
+                    const qw = getQWeather();
+                    if (!qw || !aqEnv) {
+                        comparisonLog = "comparison skipped (no qWeather env)";
+                    } else {
+                        const setQWeatherCache = qweatherCache => {
+                            aqEnv.caches.qweather = qweatherCache;
+                            Storage.setItem("@iRingo.WeatherKit.Caches", { ...aqEnv.caches, qweather: qweatherCache });
+                        };
+                        const locationsGrid = await QWeather.GetLocationsGrid(aqEnv.caches?.qweather, setQWeatherCache);
+                        const locationInfo = QWeather.GetLocationInfo(locationsGrid, aqEnv.parameters.latitude, aqEnv.parameters.longitude);
+                        const yesterdayQW = await qw.YesterdayAirQuality(locationInfo);
+                        if (yesterdayQW?.metadata?.temporarilyUnavailable || !Number.isFinite(yesterdayQW?.categoryIndex) || yesterdayQW.categoryIndex < 0) {
+                            comparisonLog = "comparison skipped (yesterday unavailable)";
+                        } else {
+                            let yesterday = yesterdayQW;
+                            if (yesterdayProvider === "Calculate") {
+                                const algorithm = AirQuality.chooseAlogrithm({ scale: probeScale }, Settings);
+                                if (!algorithm) {
+                                    comparisonLog = "comparison skipped (no algorithm for yesterday)";
+                                    yesterday = null;
+                                } else {
+                                    const calcYesterday = AirQuality.Pollutants2AQI(yesterdayQW, Settings, { algorithm });
+                                    if (!Number.isFinite(calcYesterday?.categoryIndex) || calcYesterday.categoryIndex < 1) {
+                                        comparisonLog = "comparison skipped (yesterday calculation invalid)";
+                                        yesterday = null;
+                                    } else {
+                                        yesterday = calcYesterday;
+                                    }
+                                }
+                            }
+                            if (yesterday) {
+                                let todayCat;
+                                if (yesterdayProvider === "Calculate") {
+                                    todayCat = calculated.categoryIndex;
+                                } else if (isHj) {
+                                    todayCat = calculated.categoryIndex;
+                                } else {
+                                    const qwCurrent = await qw.CurrentAirQuality();
+                                    if (qwCurrent?.metadata?.temporarilyUnavailable || !Number.isFinite(qwCurrent?.categoryIndex)) {
+                                        comparisonLog = "comparison skipped (current unavailable)";
+                                        todayCat = null;
+                                    } else {
+                                        todayCat = qwCurrent.categoryIndex;
+                                    }
+                                }
+                                if (todayCat !== undefined && todayCat !== null) {
+                                    const trend = AirQuality.CompareCategoryIndexes(todayCat, yesterday.categoryIndex);
+                                    comparisonByte = COMPARISON_BYTE_BY_TREND[trend] ?? 0;
+                                    comparisonLine = `对比昨日：\n指数：${AirQuality.appendScaleToProviderName({ metadata: yesterday.metadata, scale: yesterday.scale }, Settings)}`;
+                                    comparisonLog = `comparison ${origComparisonStr}->${trend} (QW today ${todayCat} vs yesterday ${yesterday.categoryIndex})`;
+                                }
+                            }
                         }
                     }
                 } catch (error) {
                     comparisonLog = `comparison skipped (${error?.message ?? error})`;
                 }
+            } else {
+                comparisonLog = `comparison skipped (yesterday provider ${yesterdayProvider} not wired in WK3)`;
             }
         }
-        // 元数据拼接（v2 Step 5）：原 provider + 指数行 + 对比行；logo 保持原值
-        // （首个有效 provider 即原 provider），故不重建 logo 字段。
-        const indexLine = `指数：${AirQuality.appendScaleToProviderName({ metadata: { providerName: "iRingo" }, scale: probeScale }, Settings)}`;
+        // 元数据拼接（v2 Step 5）：原 provider + 污染物行（补填时）+
+        // 指数行 + 对比行；logo 保持原值（首个有效 provider 即原
+        // provider），故不重建 logo 字段。指数行用指数来源的
+        // providerName（Calculate 为 iRingo，其余为各 provider 名）。
+        const indexProviderName = calculated?.metadata?.providerName || "iRingo";
+        const indexLine = `指数：${AirQuality.appendScaleToProviderName({ metadata: { providerName: indexProviderName }, scale: probeScale }, Settings)}`;
         const providerLines = [];
         if (providerName) providerLines.push(providerName);
+        if (filledProviderName) providerLines.push(`污染物：${filledProviderName}`);
         providerLines.push(indexLine);
         if (comparisonLine) providerLines.push(comparisonLine);
         const joinedProviderName = providerLines.join("\n");
@@ -514,7 +674,7 @@ async function calculateWK3AQ(ByteBuffer, rawBody, country, Settings, colorfulCl
         if (!overlay.body) return { body: null, log: `WK3 aq: overlay failed (${overlay.log})` };
         return {
             body: overlay.body,
-            log: `WK3 aq: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${probeScale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (pollutants vector rebuilt: ${changedDesc || "no changes"}) [${comparisonLog}] [metadata: ${metadataProviderName ? "providerName spliced" : "unchanged"}]`,
+            log: `WK3 aq: provider ${providerName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${oldScale}->${probeScale} category ${oldCategory}->${calculated.categoryIndex} index ${oldIndex}->${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (pollutants vector rebuilt: ${changedDesc || "no changes"}${filledProviderName ? `; filled from ${filledProviderName}` : ""}) [index ${indexProvider}] [${comparisonLog}] [metadata: ${metadataProviderName ? "providerName spliced" : "unchanged"}]`,
         };
     } catch (error) {
         return { body: null, log: `WK3 aq: skipped (${error?.message ?? error})` };
@@ -651,6 +811,20 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
                 if (ok) {
                     rebuildPollutants = { want, elems };
                 }
+            } else if (Array.isArray(want) && want.length > 0 && want.length <= 20 && origVecLen === 0) {
+                // 空向量补填：没有原表可复用，按 Pollutant 三字段
+                // （type int8 / amount float32 / units int8）从头建表：
+                // vtable 10 字节、表 16 字节（type@4、amount@8、
+                // units@12），各元素共用一张 vtable。
+                let ok = true;
+                for (const p of want) {
+                    if (!Number.isInteger(p.typeEnum) || p.typeEnum < 0 || p.typeEnum > 13 || !Number.isFinite(p.amount) || p.amount < 0 || !Number.isInteger(p.unitsEnum) || p.unitsEnum < 0 || p.unitsEnum > 3) { ok = false; break; }
+                }
+                if (ok) {
+                    const freshVtable = new Uint8Array([10, 0, 16, 0, 4, 0, 8, 0, 12, 0]);
+                    const elems = want.map(() => ({ table: new Uint8Array(16), vtable: freshVtable, vtableLen: 10, tableSize: 16, typeOff: 4, amountOff: 8, unitsOff: 12 }));
+                    rebuildPollutants = { want, elems, fresh: true };
+                }
             }
         } catch {
             rebuildPollutants = null;
@@ -675,10 +849,17 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
             // +4…+120 的小正数；此处复现该排布。
             newPolVecPos = align4(cursor);
             cursor = newPolVecPos + 4 + rebuildPollutants.want.length * 4;
-            for (let i = 0; i < rebuildPollutants.elems.length; i++) {
+            if (rebuildPollutants.fresh) {
+                // 补填的新表共用一张 vtable，只占一次位置。
                 const vtablePos = align4(cursor);
-                newPolVtablePositions.push(vtablePos);
-                cursor = vtablePos + rebuildPollutants.elems[i].vtableLen;
+                for (let i = 0; i < rebuildPollutants.elems.length; i++) newPolVtablePositions.push(vtablePos);
+                cursor = vtablePos + rebuildPollutants.elems[0].vtableLen;
+            } else {
+                for (let i = 0; i < rebuildPollutants.elems.length; i++) {
+                    const vtablePos = align4(cursor);
+                    newPolVtablePositions.push(vtablePos);
+                    cursor = vtablePos + rebuildPollutants.elems[i].vtableLen;
+                }
             }
             for (let i = 0; i < rebuildPollutants.elems.length; i++) {
                 const tablePos = align4(cursor);
@@ -860,7 +1041,9 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
 
 function replaceWK3CWTemperature(ByteBuffer, rawBody, country, providerName, providerCurrentWeather) {
     try {
-        if (country !== "CN") return { body: null, log: "WK3 cwReplace: skipped (country != CN)" };
+        // 国家门不在此函数内：handler 只在 country ∈ Weather.Replace
+        // 时才取 provider 数据，数据为空时下面也会跳过（与 v2
+        // InjectCurrentWeather 同款；v3.4.1-beta6 起不再硬编码 CN）。
         if (!providerCurrentWeather || !Number.isFinite(providerCurrentWeather.temperature) || !Number.isFinite(providerCurrentWeather.temperatureApparent)) {
             return { body: null, log: `WK3 cwReplace: skipped (provider ${providerName ?? "?"} current weather unavailable, original kept)` };
         }
