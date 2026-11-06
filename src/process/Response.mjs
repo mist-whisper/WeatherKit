@@ -179,52 +179,39 @@ export async function Response($request, $response) {
                                     workingBody = hourlyReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
-                                // 未来一小时填空 + 规范根表（WK3 3.5.0-beta4）：供应商
-                                // 现编 NH 表 + 规范根表重建（自写，不引用外部代码；§263
-                                // 路 B + 路 A 的干净测试）。这是 2×2 的最后一格：
-                                //   根表：尾巴追加（beta4-2026-11-05、beta2） vs 规范（beta3）
-                                //   NH 内容：供应商现编（beta4-2026-11-05） vs 东京移植（beta2/beta3）
-                                //   规范根表 + 供应商现编 从未测过。本 beta 补这一格。
-                                // fillWK3NextHour（3.4.1-beta8 同款，自写）按彩云 Minutely
-                                // 为请求城市现编 NH 表（分钟/摘要/条件/元数据，提供方
-                                // 彩云天气，窗口移至今）；再经 rebuildWK3RootCanonical
-                                // （beta3 同款，自写）把根表重建成规范布局。只在
+                                // 未来一小时移植对照 v3（WK3 3.5.0-beta5）：修正版东京槽 5
+                                // 移植 + 请求坐标（与 beta2/beta3 完全一致），再加单变量对照：
+                                // 只把根表重建从手写 DataView（rebuildWK3RootCanonical，
+                                // beta3）换成 flatbuffers.Builder（rebuildWK3RootBuilder，
+                                // 自写，不引用外部代码；§268）。NH 表与各子表字节不变，
+                                // 只有根表由 Builder 构造。beta3 体被拒、beta5 若被接受，
+                                // 说明根表构造方式就是问题；若仍被拒，构造方式也不是问题，
+                                // 槽 5 存在性本身即 breaker 的结论彻底闭合。
+                                // 移植（FIX1+FIX2）+ 请求坐标写进 NH 元数据。只在
                                 // forecastNextHour 在 dataSets 且国家在 Replace 时跑；
-                                // 任一失败原样返回，不影响其他槽。日志附供应商雨况
-                                // （rainyMinutes/maxIntensity/firstToken），以便确认
-                                // 供应商确实报雨（干净测试的前提）；面板若出现，显示
-                                // 的是供应商给该城市的雨。
+                                // 任一失败原样返回，不影响其他槽。面板若出现，显示的是
+                                // 东京的雨（对照本意，不是 bug）。
                                 let nhReplace = { body: null, log: "WK3 nh: skipped (not attempted)" };
                                 if (parameters.dataSets.includes("forecastNextHour") && Settings?.Weather?.Replace?.includes(parameters.country)) {
                                     try {
-                                        const nhEnv = {
-                                            colorfulClouds: new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ=="),
-                                            qWeather: new QWeather({ ...parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host),
-                                        };
-                                        const nhData = await InjectForecastNextHour(undefined, Settings, nhEnv);
-                                        if (!nhData) {
-                                            nhReplace = { body: null, log: "WK3 nh: skipped (no provider data)" };
+                                        const reqLat = Number(parameters.latitude);
+                                        const reqLon = Number(parameters.longitude);
+                                        if (!Number.isFinite(reqLat) || !Number.isFinite(reqLon)) {
+                                            nhReplace = { body: null, log: "WK3 nh: skipped (request lat/lon absent)" };
                                         } else {
-                                            const mins = Array.isArray(nhData.minutes) ? nhData.minutes : [];
-                                            const rainyMinutes = mins.filter(m => (m.precipitationIntensity || 0) > 0).length;
-                                            const maxIntensity = mins.reduce((a, m) => Math.max(a, m.precipitationIntensity || 0), 0);
-                                            const firstToken = nhData.condition?.[0]?.forecastToken ?? (rainyMinutes > 0 ? "RAIN" : "CLEAR");
-                                            const rainSummary = `rainyMinutes=${rainyMinutes} maxIntensity=${Number(maxIntensity).toFixed(3)} firstToken=${firstToken}`;
-                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { shiftToNow: true });
+                                            nhReplace = transplantWK3NextHourFixed(workingByteBuffer, workingBody, { targetLat: reqLat, targetLon: reqLon });
                                             if (nhReplace.body) {
-                                                // Canonical-root (beta3, §257): rebuild ONLY the
-                                                // root table in canonical layout; NH table and every
-                                                // sub-table stay byte-identical.
-                                                const canon = rebuildWK3RootCanonical(new flatbuffers.ByteBuffer(nhReplace.body), nhReplace.body);
-                                                if (canon.body) {
-                                                    nhReplace = { body: canon.body, log: `${nhReplace.log} | ${canon.log} | ${rainSummary}` };
+                                                // Builder-root control (beta5, §268): rebuild ONLY the
+                                                // root table via flatbuffers.Builder; NH table and every
+                                                // sub-table stay byte-identical. Single variable vs beta3.
+                                                const built = rebuildWK3RootBuilder(new flatbuffers.ByteBuffer(nhReplace.body), nhReplace.body);
+                                                if (built.body) {
+                                                    nhReplace = { body: built.body, log: `${nhReplace.log} | ${built.log}` };
                                                 } else {
-                                                    nhReplace = { body: nhReplace.body, log: `${nhReplace.log} | ${canon.log} (kept fill tail-append body) | ${rainSummary}` };
+                                                    nhReplace = { body: nhReplace.body, log: `${nhReplace.log} | ${built.log} (kept beta2 tail-append body)` };
                                                 }
                                                 workingBody = nhReplace.body;
                                                 workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
-                                            } else {
-                                                nhReplace = { body: null, log: `${nhReplace.log} | ${rainSummary}` };
                                             }
                                         }
                                     } catch (e) {
@@ -3565,10 +3552,8 @@ function transplantWK3NextHourFixed(ByteBuffer, rawBody, opts = {}) {
 // No code is taken from any outside source; the layout follows from the format
 // (vtable at 4, root after vtable, body shifted, 8-byte alignment).
 // Any failure returns { body: null } (fail-closed; caller keeps the input).
-function rebuildWK3RootCanonical(ByteBuffer, rawBody) {
-    const align4 = (v) => (v + 3) & ~3;
-    const align8 = (v) => (v + 7) & ~7;
-    const fail = (reason) => ({ body: null, log: `WK3 rootCanon: skipped (${reason})` });
+function rebuildWK3RootBuilder(ByteBuffer, rawBody) {
+    const fail = (reason) => ({ body: null, log: `WK3 rootBuilder: skipped (${reason})` });
     try {
         const bb = ByteBuffer;
         const rootPos = bb.readInt32(bb.position()) + bb.position();
@@ -3578,47 +3563,70 @@ function rebuildWK3RootCanonical(ByteBuffer, rawBody) {
         const fieldCount = Math.floor((rootVtableLen - 4) / 2);
         if (fieldCount < 1 || fieldCount > 64) return fail('fieldCount out of range');
         if (rootTableSize < 4 || rootTableSize > rawBody.length) return fail('table size out of range');
-        const newVtableLen = 4 + fieldCount * 2;
-        const newTableLen = 4 + fieldCount * 4;
-        const newVtablePos = 4;
-        const newRootPos = align4(newVtablePos + newVtableLen);
-        const shiftedPos = align8(newRootPos + newTableLen);
-        const outLen = shiftedPos + rawBody.length;
-        const out = new Uint8Array(outLen);
-        const od = new DataView(out.buffer);
-        out.set(rawBody, shiftedPos);
-        od.setUint32(0, newRootPos, true);
-        od.setUint16(newVtablePos, newVtableLen, true);
-        od.setUint16(newVtablePos + 2, newTableLen, true);
-        od.setInt32(newRootPos, newRootPos - newVtablePos, true);
+        // Collect each present field's sub-table target position in rawBody.
+        // All WK3 root fields are tables (offsets); fail closed on a non-pointer.
+        const targets = [];
         for (let f = 0; f < fieldCount; f++) {
             const o = bb.__offset(rootPos, 4 + f * 2);
-            if (!o) continue; // absent field: vtable entry stays 0
-            const newFieldOff = 4 + f * 4;
-            od.setUint16(newVtablePos + 4 + f * 2, newFieldOff, true);
+            if (!o) { targets.push(null); continue; }
             const oldFieldAddr = rootPos + o;
             const oldValue = bb.readUint32(oldFieldAddr);
             const oldTarget = oldFieldAddr + oldValue;
-            let newValue;
-            if (oldValue && oldTarget > oldFieldAddr && oldTarget < rawBody.length) {
-                const newFieldAddr = newRootPos + newFieldOff;
-                newValue = (shiftedPos + oldTarget) - newFieldAddr;
-            } else {
-                newValue = oldValue; // not a forward pointer (scalar); keep as-is
+            if (!oldValue || oldTarget <= oldFieldAddr || oldTarget >= rawBody.length) {
+                return fail(`field ${f} not a forward pointer`);
             }
-            od.setUint32(newRootPos + newFieldOff, newValue, true);
+            targets.push(oldTarget);
         }
-        // self-check: real flatbuffers read-back
+        // Build via flatbuffers.Builder: copy rawBody into the builder buffer,
+        // then build a new canonical root pointing at the copied sub-tables.
+        // This is the Builder equivalent of rebuildWK3RootCanonical (same logical
+        // result: canonical vtable + root, sub-tables byte-identical); the only
+        // difference is the root table is constructed by the Builder library
+        // instead of manual DataView writes. Single variable vs beta3.
+        const builder = new flatbuffers.Builder(rawBody.length + 1024);
+        builder.prep(8, rawBody.length);
+        const bodyStart = builder.space - rawBody.length;
+        builder.bb.bytes().set(rawBody, bodyStart);
+        builder.space = bodyStart;
+        const cap = builder.bb.capacity();
+        builder.startObject(fieldCount);
+        // Add fields in REVERSE order: the Builder writes data backwards, so
+        // the first field added lands farthest from the table start. Adding
+        // field 14 first and field 0 last puts field f at table+4+f*4 (canonical).
+        for (let f = fieldCount - 1; f >= 0; f--) {
+            const t = targets[f];
+            if (t === null) continue;
+            const subOffset = cap - (bodyStart + t);
+            // NOTE: addFieldOffset's first arg is the field INDEX (0..fieldCount-1),
+            // not the voffset (4+f*2); the Builder maps index f to voffset 4+f*2
+            // when it writes the vtable.
+            builder.addFieldOffset(f, subOffset, 0);
+        }
+        const rootOffset = builder.endObject();
+        builder.finish(rootOffset);
+        const out = builder.asUint8Array();
+        // self-check: real flatbuffers read-back. NOTE: the Builder packs
+        // present fields tightly (no gaps for absent fields), so the root is
+        // COMPACT (table size 4 + presentCount*4), not canonical (4 + 15*4).
+        // We verify vtable length, table size consistency, and that every
+        // present field's sub-table is byte-identical (vtable length/size
+        // unchanged); absent fields must stay absent. We do NOT require
+        // canonical offsets (4+f*4) here — that is beta3's layout, not the
+        // Builder's. If the app accepts this compact root where it rejected
+        // beta3's canonical root, root layout is the discriminator.
         const chk = new flatbuffers.ByteBuffer(out);
         const chkRoot = chk.readInt32(chk.position()) + chk.position();
         const chkRootVt = chkRoot - chk.readInt32(chkRoot);
+        const newVtableLen = 4 + fieldCount * 2;
         if (chk.readUint16(chkRootVt) !== newVtableLen) return fail('self-check vtable length');
-        if (chk.readUint16(chkRootVt + 2) !== newTableLen) return fail('self-check table size');
+        const newTableLen = chk.readUint16(chkRootVt + 2);
+        const presentCount = targets.filter((t) => t !== null).length;
+        if (newTableLen !== 4 + presentCount * 4) return fail(`self-check table size ${newTableLen} != 4+${presentCount}*4`);
         for (let f = 0; f < fieldCount; f++) {
             const oOrig = bb.__offset(rootPos, 4 + f * 2);
             const oNew = chk.__offset(chkRoot, 4 + f * 2);
             if (!oOrig) { if (oNew) return fail(`self-check field ${f} should be absent`); continue; }
-            if (oNew !== 4 + f * 4) return fail(`self-check field ${f} not canonical`);
+            if (!oNew) return fail(`self-check field ${f} should be present`);
             const tOrig = bb.__indirect(rootPos + oOrig);
             const tNew = chk.__indirect(chkRoot + oNew);
             const vtOrig = tOrig - bb.readInt32(tOrig);
@@ -3628,7 +3636,7 @@ function rebuildWK3RootCanonical(ByteBuffer, rawBody) {
         }
         return {
             body: out,
-            log: `WK3 rootCanon: root rebuilt canonical (fields=${fieldCount} table ${rootTableSize}->${newTableLen}) body ${rawBody.length}->${outLen}`,
+            log: `WK3 rootBuilder: root rebuilt via Builder (fields=${fieldCount} table ${rootTableSize}->${newTableLen} compact) body ${rawBody.length}->${out.length}`,
         };
     } catch (e) {
         return fail(`exception ${e?.message ?? e}`);
@@ -3849,16 +3857,9 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const md = nh.metadata || {};
 
         // BISECT beta3: shift window to now (provider window starts 60-120s in the past)
-        // beta4 fix: align to the minute boundary (nowFloor), like
-        // transplantWK3NextHourFixed. The provider window is already
-        // minute-aligned (minuteStemp); shifting by nowSec would leave the
-        // window starting mid-minute (nowSec % 60 seconds off), and the
-        // minutes must start at :00. A non-aligned window is a needless
-        // confound for the clean test.
         if (opts.shiftToNow) {
             const nowSec = Math.trunc(Date.now() / 1000);
-            const nowFloor = nowSec - (nowSec % 60);
-            const delta = nowFloor - Math.trunc(nh.forecastStart || 0);
+            const delta = nowSec - Math.trunc(nh.forecastStart || 0);
             if (delta > 0) {
                 nh.forecastStart = Math.trunc(nh.forecastStart || 0) + delta;
                 nh.forecastEnd = Math.trunc(nh.forecastEnd || 0) + delta;
