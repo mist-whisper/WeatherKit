@@ -1242,7 +1242,7 @@ async function calculateWK3AQFillSlot0(ByteBuffer, rawBody, country, Settings, a
                                 const trend = AirQuality.CompareCategoryIndexes(todayCat, yesterday.categoryIndex);
                                 comparisonByte = COMPARISON_BYTE_BY_TREND[trend] ?? 0;
                                 comparisonLine = `对比昨日：\n指数：${AirQuality.appendScaleToProviderName({ metadata: yesterday.metadata, scale: yesterday.scale }, Settings)}`;
-                                comparisonLog = `comparison ${origComparisonStr}->${trend} (CC today ${todayCat} vs yesterday ${yesterday.categoryIndex})`;
+                                comparisonLog = `comparison ${origComparisonStr}->${trend} (CC today(${useUsa ? "US" : "CN"}) ${todayCat} vs yesterday ${yesterday.categoryIndex})`;
                             }
                         }
                     } catch (error) {
