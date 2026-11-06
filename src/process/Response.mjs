@@ -179,7 +179,10 @@ export async function Response($request, $response) {
                                     workingBody = hourlyReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
-                                // 未来一小时移植对照 v2（WK3 3.5.0-beta1）：修正版东京槽 5
+                                // 未来一小时移植对照 v2（WK3 3.5.0-beta2）：修正版东京槽 5
+                                // beta2 修正：beta1 的守卫用 Number.isFinite 直接判
+                                // parseWeatherKitURL 返回的字符串经纬度，恒为 false，
+                                // 移植从未执行（§253）；此处先 Number() 再判有限。
                                 // 移植（FIX1+FIX2）+ 请求坐标写进 NH 元数据。§195 已证实
                                 // 修正版移植（AQ 元数据经纬度）上机仍被拒，存在性本身是
                                 // breaker（对 CN 城市）；本次单变量只改经纬度来源（请求
@@ -191,10 +194,12 @@ export async function Response($request, $response) {
                                 let nhReplace = { body: null, log: "WK3 nh: skipped (not attempted)" };
                                 if (parameters.dataSets.includes("forecastNextHour") && Settings?.Weather?.Replace?.includes(parameters.country)) {
                                     try {
-                                        if (!Number.isFinite(parameters.latitude) || !Number.isFinite(parameters.longitude)) {
+                                        const reqLat = Number(parameters.latitude);
+                                        const reqLon = Number(parameters.longitude);
+                                        if (!Number.isFinite(reqLat) || !Number.isFinite(reqLon)) {
                                             nhReplace = { body: null, log: "WK3 nh: skipped (request lat/lon absent)" };
                                         } else {
-                                            nhReplace = transplantWK3NextHourFixed(workingByteBuffer, workingBody, { targetLat: parameters.latitude, targetLon: parameters.longitude });
+                                            nhReplace = transplantWK3NextHourFixed(workingByteBuffer, workingBody, { targetLat: reqLat, targetLon: reqLon });
                                             if (nhReplace.body) {
                                                 workingBody = nhReplace.body;
                                                 workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
