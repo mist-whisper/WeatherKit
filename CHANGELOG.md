@@ -2,7 +2,7 @@
   * none
 
 ### 🛠️ Bug Fixes
-  * 为 Surge、Egern、Quantumult X、Stash 补上 `/api/v3/weather/` 改写规则：此前仅 Loon 模板带有 v3 规则，其余四平台缺失，导致 WK3 天气数据在这些平台上不触发脚本、不替换、不记日志。Egern 的 .yaml 由 Surge 模块转换生成，随本次修复一并带上。Loon 不用改动。
+  * 去掉 Surge v3 规则里的 `engine=webview`，回落到默认引擎：v3.4.6 在 Surge 上脚本始终不执行（无日志、无数据替换），而 Loon/Egern 正常；脚本已确认可下载、编辑器里可跑，问题指向 WebView 引擎在真实 v3 响应上加载/执行失败。v2 规则暂不动（现代天气 App 不走 v2）。
 
 ### 🔣 Dependencies
   * none
