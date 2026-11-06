@@ -378,7 +378,12 @@ async function calculateWK3AQ(ByteBuffer, rawBody, country, Settings, aqEnv = nu
         const rootFieldCount = Math.floor((ByteBuffer.readUint16(rootVtablePos) - 4) / 2);
         if (rootFieldCount !== 15) return { body: null, log: `WK3 aq: skipped (unexpected root fields=${rootFieldCount})` };
         const slot0Offset = ByteBuffer.__offset(rootPos, 4);
-        if (!slot0Offset) return { body: null, log: "WK3 aq: skipped (slot 0 absent)" };
+        if (!slot0Offset) {
+            // slot 0 缺失（县级城市，见 ANALYSIS §227/§166）：不直接跳过，改走
+            // 补槽分支；供应商无 AQ 时补槽函数内仍返回 skipped，原样返回。
+            // 在场路径一字未动。
+            return calculateWK3AQFillSlot0(ByteBuffer, rawBody, country, Settings, aqEnv, { algorithm });
+        }
         const aqPos = ByteBuffer.__indirect(rootPos + slot0Offset);
         const aqMetaOffset = ByteBuffer.__offset(aqPos, 4);
         const aqCategoryOffset = ByteBuffer.__offset(aqPos, 6);
@@ -1042,6 +1047,568 @@ function overlayWK3AQ(ByteBuffer, rawBody, country, newCategory, newIndex, optio
         return { body: null, log: `WK3 aqOverlay: skipped (${error?.message ?? error})` };
     }
 }
+
+/**
+ * WK3 AQ 补槽（slot 0 缺失时新建 AQ 表，append-and-repoint）。
+ * 仅由 calculateWK3AQ 在 slot 0 缺失时调用；在场路径一字未动。
+ *
+ * 做法（ANALYSIS §227 的 append-and-repoint，不整包重建）：
+ * 新包体布局：[新根表 uoffset][新根表 vtable][新根表][新 AQ vtable]
+ * [新 AQ 表][新 scale 串][新元数据 vtable + 表 + providerName 新串]
+ * [污染物向量 + 共用 vtable + 各污染物表][原始包体 verbatim（8 字节对齐的 blob）]。
+ * 新根表 = 原根表 + 4 字节（slot 0 字段追加在表尾，vtable entry0 = 原表长；
+ * 根表字段顺序固定为 4,6,7,9,14,5,3,2,1,0，slot 0 本来就在最后一位，
+ * 故缺失时其余槽偏移不变、追加即与 Apple 自建体一致）；其余槽重算指向 blob。
+ * 新 AQ 表为自建固定布局（8 字段全在 vtable 内，无尾部 0 表项，见 §207
+ * 的 vtable 截短教训）：f7 scale @4、f6 主污染物 @8、f3 是否显著 @9
+ * （仅 true 时在表，false 按 Builder 惯例省略）、f5 昨日对比 @10
+ * （仅算出时在表）、f1 档位 @11、f2 指数 int16 @12、f4 污染物向量 @16、
+ * f0 元数据 @20，表长 24。污染物元素沿用 overlay 的 fresh 分支形态
+ * （vtable 10 字节、表 16 字节 type@4/amount@8/units@12，共用一张 vtable），
+ * 向量在表之前（beta10 教训：元素偏移必须为无符号前向小正数）。
+ *
+ * 供应商取数与档位计算与在场路径同一套，不另起算法：污染物取数走
+ * Pollutants.Provider（默认 ColorfulClouds；QWeather 同款调用）；指数
+ * 按 Index.Provider 分发（QWeather / ColorfulCloudsUS/CN / WAQI /
+ * 默认内置 Calculate + Pollutants2AQI，算法跟 Calculate.Algorithm，
+ * 默认 EU_EAQI）；昨日对比走 Comparison.Yesterday.IndexProvider
+ * （默认 ColorfulCloudsUS），与在场路径同一分发、同一趋势映射
+ * （UNKNOWN 0、WORSE 2、SAME 3、BETTER 4）。刻度不写死：取指数结果
+ * 的 scale（Calculate + EU_EAQI 时为 EU.EAQI，已确认可显示；HK.AQHI
+ * 时沿用在场路径的 .1 后缀规则）。scale 门不适用（无原 scale 可比对），
+ * 故补槽分支不设 scale 门；国家门与算法门由调用方 calculateWK3AQ
+ * 在进分支前已把过（Replace / None）。
+ *
+ * 元数据：没有原 AQ 元数据可复用，故照抄同体 slot 1（当前天气）的
+ * 元数据表形态（同一城市、同一经纬度与时间，attributionUrl 等标量
+ * 原样保留，不编造来源字符串），只把 providerName（字段 6）换成
+ * 拼接后的 provider 行（污染物：/指数：/对比昨日：，与在场路径同一
+ * 拼接）；模板若已有字段 6 则重指向新串，若无则表尾追加 4 字节补位
+ * （与 overlay 的对比字段补位同一手法）。slot 1 缺失时按
+ * 2,3,4,6,7,14,9 顺序找第一个带元数据的槽作模板；全无则跳过。
+ * 直接指数源不带污染物（如 WAQI）时，向量改用供应商污染物
+ * （在场路径是“向量保持原样”，缺槽时没有原样可保持）。
+ * 任一校验失败都原样返回（body 为 null），绝不输出半成品包体。
+ * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
+ * @param {Uint8Array} rawBody - 原始包体（slot 0 缺失）
+ * @param {string} country - 请求的 country 参数
+ * @param {any} Settings - 插件 Settings
+ * @param {any} aqEnv - handler 建的 AQ 环境（parameters / caches / colorfulClouds）
+ * @param {any} opts - { algorithm }（调用方已算好的算法名）
+ * @returns {Promise<{body: Uint8Array | null, log: string}>}
+ */
+async function calculateWK3AQFillSlot0(ByteBuffer, rawBody, country, Settings, aqEnv, opts = {}) {
+    try {
+        const algorithm = opts?.algorithm ?? Settings?.AirQuality?.Calculate?.Algorithm ?? "EU_EAQI";
+        if (algorithm === "None") return { body: null, log: "WK3 aqFill: skipped (algorithm None)" };
+        const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
+        if (rootPos < 0 || rootPos + 4 > rawBody.length) return { body: null, log: "WK3 aqFill: skipped (root out of range)" };
+        const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
+        const rootFieldCount = Math.floor((ByteBuffer.readUint16(rootVtablePos) - 4) / 2);
+        if (rootFieldCount !== 15) return { body: null, log: `WK3 aqFill: skipped (unexpected root fields=${rootFieldCount})` };
+        if (ByteBuffer.__offset(rootPos, 4)) return { body: null, log: "WK3 aqFill: skipped (slot 0 present, fill not needed)" };
+        if (!aqEnv) return { body: null, log: "WK3 aqFill: skipped (no aqEnv)" };
+        // 和风与 WAQI 实例按需建（与 calculateWK3AQ 同款闭包；token 一律走 Settings 接口）。
+        const colorfulClouds = aqEnv?.colorfulClouds ?? null;
+        const getQWeather = () => {
+            if (!aqEnv) return null;
+            if (!aqEnv.qWeather) aqEnv.qWeather = new QWeather({ ...aqEnv.parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host);
+            return aqEnv.qWeather;
+        };
+        const getWAQI = () => {
+            if (!aqEnv) return null;
+            if (!aqEnv.waqi) aqEnv.waqi = new WAQI(aqEnv.parameters, Settings?.API?.WAQI?.Token);
+            return aqEnv.waqi;
+        };
+        // WK3 污染物类型枚举相对 WK2 数组整体错位一位（ANALYSIS §174/§175，
+        // 与在场路径同一数组）：真值 = 数组[typeByte - 1]，头部补一位占位。
+        const pollutantTypes = ["UNKNOWN0", "NOT_AVAILABLE", "C6H6", "NH3", "NMHC", "NO", "NO2", "NOX", "OZONE", "PM2_5", "SO2", "PM10", "CO", "UNKNOWN12", "UNKNOWN13"];
+        const unitEnumByName = { PARTS_PER_BILLION: 0, MICROGRAMS_PER_CUBIC_METER: 1, UNKNOWN3: 3 };
+        // 污染物取数：缺槽时没有苹果向量，恒走供应商（与在场路径 vecLen===0
+        // 的补填分支同一调用）；取不到则跳过，不凭空造数。
+        const pollutantsProvider = Settings?.AirQuality?.Current?.Pollutants?.Provider ?? "ColorfulClouds";
+        let filledPollutants = null;
+        let filledProviderName = null;
+        try {
+            const filled = pollutantsProvider === "QWeather"
+                ? await getQWeather()?.CurrentAirQuality()
+                : await colorfulClouds?.CurrentAirQuality();
+            if (filled && !filled.metadata?.temporarilyUnavailable && Array.isArray(filled.pollutants) && filled.pollutants.length > 0) {
+                filledPollutants = filled.pollutants;
+                filledProviderName = filled.metadata?.providerName || pollutantsProvider;
+            }
+        } catch {
+            filledPollutants = null;
+        }
+        if (!filledPollutants) return { body: null, log: `WK3 aqFill: skipped (supplier ${pollutantsProvider} unavailable)` };
+        // 供应商缺失值常以 -1 占位，需滤掉；单位串须在 overlay 可写枚举内。
+        const pollutants = filledPollutants
+            .filter(p => pollutantTypes.includes(p.pollutantType) && unitEnumByName[p.units] !== undefined && Number.isFinite(p.amount) && p.amount >= 0)
+            .map(p => ({ pollutantType: p.pollutantType, amount: p.amount, units: p.units }));
+        if (pollutants.length === 0) return { body: null, log: "WK3 aqFill: skipped (supplier pollutants unusable)" };
+        // 指数来源按 Index.Provider 分发（与在场路径同一分发）；默认仍为内置 Calculate。
+        const indexProvider = Settings?.AirQuality?.Current?.Index?.Provider ?? "Calculate";
+        const forceCNPrimary = Settings?.AirQuality?.Current?.Index?.ForceCNPrimaryPollutants;
+        let calculated = null;
+        if (indexProvider === "QWeather") {
+            const qw = getQWeather();
+            const direct = qw ? await qw.CurrentAirQuality(forceCNPrimary) : null;
+            if (!direct || direct.metadata?.temporarilyUnavailable) return { body: null, log: "WK3 aqFill: skipped (QWeather index unavailable)" };
+            calculated = direct;
+        } else if (indexProvider === "ColorfulCloudsUS" || indexProvider === "ColorfulCloudsCN") {
+            if (!colorfulClouds) return { body: null, log: "WK3 aqFill: skipped (no colorfulClouds env)" };
+            const direct = await colorfulClouds.CurrentAirQuality(indexProvider === "ColorfulCloudsUS", forceCNPrimary);
+            if (!direct || direct.metadata?.temporarilyUnavailable) return { body: null, log: `WK3 aqFill: skipped (${indexProvider} index unavailable)` };
+            calculated = direct;
+        } else if (indexProvider === "WAQI") {
+            const waqi = getWAQI();
+            if (!waqi) return { body: null, log: "WK3 aqFill: skipped (no WAQI env)" };
+            let direct = null;
+            if (Settings?.API?.WAQI?.Token) {
+                direct = await waqi.AQI2();
+            } else {
+                const nearest = await waqi.Nearest();
+                if (nearest?.metadata?.stationId) {
+                    const token = await waqi.Token(nearest.metadata.stationId);
+                    const aqi = token ? await waqi.AQI(nearest.metadata.stationId, token) : null;
+                    if (aqi) direct = { metadata: { ...nearest.metadata, ...aqi.metadata }, ...nearest, ...aqi };
+                }
+            }
+            if (!direct || direct.metadata?.temporarilyUnavailable) return { body: null, log: "WK3 aqFill: skipped (WAQI index unavailable)" };
+            calculated = direct;
+        } else {
+            const effectiveSettings = {
+                ...Settings,
+                AirQuality: { ...(Settings?.AirQuality ?? {}), Calculate: { ...(Settings?.AirQuality?.Calculate ?? {}), Algorithm: algorithm } },
+            };
+            calculated = AirQuality.Pollutants2AQI({ pollutants, metadata: { providerName: filledProviderName } }, effectiveSettings);
+        }
+        if (!Number.isFinite(calculated?.index) || calculated.index < 0 || !Number.isFinite(calculated?.categoryIndex) || calculated.categoryIndex < 1 || calculated.categoryIndex > 10) {
+            return { body: null, log: `WK3 aqFill: skipped (index invalid: index=${calculated?.index} category=${calculated?.categoryIndex})` };
+        }
+        const primaryEnum = pollutantTypes.indexOf(calculated.primaryPollutant);
+        if (primaryEnum < 0) return { body: null, log: `WK3 aqFill: skipped (primary pollutant unknown: ${calculated.primaryPollutant})` };
+        const perPollutant = (calculated.pollutants ?? []).map(p => `${p.pollutantType}=${Number.isFinite(p.index) ? p.index.toFixed(2) : p.index}`).join(" ");
+        // 污染物向量输入：优先用指数结果的污染物（与在场路径空向量补填的
+        // fresh 分支同一推导）；直接指数源不带污染物时改用供应商污染物。
+        let newPollutants = (calculated.pollutants ?? [])
+            .filter(p => pollutantTypes.includes(p.pollutantType) && unitEnumByName[p.units] !== undefined && Number.isFinite(p.amount) && p.amount >= 0)
+            .map(p => ({ typeEnum: pollutantTypes.indexOf(p.pollutantType), amount: p.amount, unitsEnum: unitEnumByName[p.units] }));
+        if (newPollutants.length === 0) {
+            newPollutants = pollutants.map(p => ({ typeEnum: pollutantTypes.indexOf(p.pollutantType), amount: p.amount, unitsEnum: unitEnumByName[p.units] }));
+        }
+        // HK.AQHI 后缀规则与在场路径一致（WK3 体内苹果自带 scale 均带版本后缀）。
+        const probeScale = calculated.scale === "HK.AQHI" ? "HK.AQHI.1" : calculated.scale;
+        // 昨日对比（与在场路径同一分发、同一趋势映射）：新槽原值即 UNKNOWN，
+        // 故恒需计算；失败只退回“无对比”（字段省略），不影响指数补槽。
+        // ComparisonTrend 字节映射取自 3.2 bundle 内生成枚举（已核实）：
+        // UNKNOWN 0、MUCH_WORSE 1、WORSE 2、SAME 3、BETTER 4、MUCH_BETTER 5。
+        const COMPARISON_BYTE_BY_TREND = { UNKNOWN: 0, WORSE: 2, SAME: 3, BETTER: 4 };
+        const COMPARISON_TREND_BY_BYTE = { 0: "UNKNOWN", 1: "MUCH_WORSE", 2: "WORSE", 3: "SAME", 4: "BETTER", 5: "MUCH_BETTER" };
+        const origComparisonStr = "UNKNOWN";
+        const needComputeComparison = origComparisonStr === "UNKNOWN" || Settings?.AirQuality?.Comparison?.ReplaceWhenCurrentChange === true;
+        let comparisonByte = null;
+        let comparisonLine = null;
+        let comparisonLog = "comparison unchanged";
+        if (needComputeComparison) {
+            const yesterdayProvider = Settings?.AirQuality?.Comparison?.Yesterday?.IndexProvider ?? "ColorfulCloudsUS";
+            const currentIndexProvider = Settings?.AirQuality?.Current?.Index?.Provider ?? "Calculate";
+            const isHj = currentIndexProvider === "Calculate"
+                ? Settings?.AirQuality?.Calculate?.Algorithm === "WAQI_InstantCast_CN"
+                : (currentIndexProvider === "QWeather" || currentIndexProvider === "ColorfulCloudsCN");
+            const isEpa = currentIndexProvider === "WAQI" || currentIndexProvider === "ColorfulCloudsUS";
+            if (yesterdayProvider === "ColorfulCloudsUS" || yesterdayProvider === "ColorfulCloudsCN") {
+                const useUsa = yesterdayProvider !== "ColorfulCloudsCN";
+                if (!colorfulClouds) {
+                    comparisonLog = "comparison skipped (no colorfulClouds env)";
+                } else {
+                    try {
+                        const todayCatFromInjected = yesterdayProvider === "ColorfulCloudsCN" ? (isHj ? calculated.categoryIndex : undefined) : (isEpa ? calculated.categoryIndex : undefined);
+                        const yesterday = await colorfulClouds.YesterdayAirQuality(useUsa);
+                        if (yesterday?.metadata?.temporarilyUnavailable || !Number.isFinite(yesterday?.categoryIndex)) {
+                            comparisonLog = "comparison skipped (yesterday unavailable)";
+                        } else {
+                            let todayCat = todayCatFromInjected;
+                            if (todayCat === undefined) {
+                                const ccCurrent = await colorfulClouds.CurrentAirQuality(useUsa);
+                                if (ccCurrent?.metadata?.temporarilyUnavailable || !Number.isFinite(ccCurrent?.categoryIndex)) {
+                                    comparisonLog = "comparison skipped (current unavailable)";
+                                    todayCat = null;
+                                } else {
+                                    todayCat = ccCurrent.categoryIndex;
+                                }
+                            }
+                            if (todayCat !== undefined && todayCat !== null) {
+                                const trend = AirQuality.CompareCategoryIndexes(todayCat, yesterday.categoryIndex);
+                                comparisonByte = COMPARISON_BYTE_BY_TREND[trend] ?? 0;
+                                comparisonLine = `对比昨日：\n指数：${AirQuality.appendScaleToProviderName({ metadata: yesterday.metadata, scale: yesterday.scale }, Settings)}`;
+                                comparisonLog = `comparison ${origComparisonStr}->${trend} (CC today ${todayCat} vs yesterday ${yesterday.categoryIndex})`;
+                            }
+                        }
+                    } catch (error) {
+                        comparisonLog = `comparison skipped (${error?.message ?? error})`;
+                    }
+                }
+            } else if (yesterdayProvider === "QWeather" || yesterdayProvider === "Calculate") {
+                try {
+                    const qw = getQWeather();
+                    if (!qw || !aqEnv) {
+                        comparisonLog = "comparison skipped (no qWeather env)";
+                    } else {
+                        const setQWeatherCache = qweatherCache => {
+                            aqEnv.caches.qweather = qweatherCache;
+                            Storage.setItem("@iRingo.WeatherKit.Caches", { ...aqEnv.caches, qweather: qweatherCache });
+                        };
+                        const locationsGrid = await QWeather.GetLocationsGrid(aqEnv.caches?.qweather, setQWeatherCache);
+                        const locationInfo = QWeather.GetLocationInfo(locationsGrid, aqEnv.parameters.latitude, aqEnv.parameters.longitude);
+                        const yesterdayQW = await qw.YesterdayAirQuality(locationInfo);
+                        if (yesterdayQW?.metadata?.temporarilyUnavailable || !Number.isFinite(yesterdayQW?.categoryIndex) || yesterdayQW.categoryIndex < 0) {
+                            comparisonLog = "comparison skipped (yesterday unavailable)";
+                        } else {
+                            let yesterday = yesterdayQW;
+                            if (yesterdayProvider === "Calculate") {
+                                const algorithm = AirQuality.chooseAlogrithm({ scale: probeScale }, Settings);
+                                if (!algorithm) {
+                                    comparisonLog = "comparison skipped (no algorithm for yesterday)";
+                                    yesterday = null;
+                                } else {
+                                    const calcYesterday = AirQuality.Pollutants2AQI(yesterdayQW, Settings, { algorithm });
+                                    if (!Number.isFinite(calcYesterday?.categoryIndex) || calcYesterday.categoryIndex < 1) {
+                                        comparisonLog = "comparison skipped (yesterday calculation invalid)";
+                                        yesterday = null;
+                                    } else {
+                                        yesterday = calcYesterday;
+                                    }
+                                }
+                            }
+                            if (yesterday) {
+                                let todayCat;
+                                if (yesterdayProvider === "Calculate") {
+                                    todayCat = calculated.categoryIndex;
+                                } else if (isHj) {
+                                    todayCat = calculated.categoryIndex;
+                                } else {
+                                    const qwCurrent = await qw.CurrentAirQuality();
+                                    if (qwCurrent?.metadata?.temporarilyUnavailable || !Number.isFinite(qwCurrent?.categoryIndex)) {
+                                        comparisonLog = "comparison skipped (current unavailable)";
+                                        todayCat = null;
+                                    } else {
+                                        todayCat = qwCurrent.categoryIndex;
+                                    }
+                                }
+                                if (todayCat !== undefined && todayCat !== null) {
+                                    const trend = AirQuality.CompareCategoryIndexes(todayCat, yesterday.categoryIndex);
+                                    comparisonByte = COMPARISON_BYTE_BY_TREND[trend] ?? 0;
+                                    comparisonLine = `对比昨日：\n指数：${AirQuality.appendScaleToProviderName({ metadata: yesterday.metadata, scale: yesterday.scale }, Settings)}`;
+                                    comparisonLog = `comparison ${origComparisonStr}->${trend} (QW today ${todayCat} vs yesterday ${yesterday.categoryIndex})`;
+                                }
+                            }
+                        }
+                    }
+                } catch (error) {
+                    comparisonLog = `comparison skipped (${error?.message ?? error})`;
+                }
+            } else {
+                comparisonLog = `comparison skipped (yesterday provider ${yesterdayProvider} not wired in WK3)`;
+            }
+        }
+        // 元数据拼接（与在场路径同一拼接）：新槽无原 provider 名，首行即
+        // 污染物行；指数行用指数来源的 providerName（Calculate 为 iRingo，
+        // 其余为各 provider 名）。
+        const indexProviderName = calculated?.metadata?.providerName || "iRingo";
+        const indexLine = `指数：${AirQuality.appendScaleToProviderName({ metadata: { providerName: indexProviderName }, scale: probeScale }, Settings)}`;
+        const providerLines = [];
+        if (filledProviderName) providerLines.push(`污染物：${filledProviderName}`);
+        providerLines.push(indexLine);
+        if (comparisonLine) providerLines.push(comparisonLine);
+        const joinedProviderName = providerLines.join("\n");
+        const metadataProviderName = joinedProviderName.length > 0 ? joinedProviderName : null;
+        const fill = overlayWK3AQFill(ByteBuffer, rawBody, country, calculated.categoryIndex, Math.round(calculated.index), {
+            scale: probeScale,
+            primaryEnum,
+            isSignificant: calculated.isSignificant,
+            pollutants: newPollutants,
+            comparisonByte,
+            metadataProviderName,
+        });
+        if (!fill.body) return { body: null, log: `WK3 aqFill: overlay failed (${fill.log})` };
+        return {
+            body: fill.body,
+            log: `WK3 aqFill: slot 0 created provider ${filledProviderName || "?"} pollutants ${pollutants.length} [${perPollutant}] scale ${probeScale} category ${calculated.categoryIndex} index ${Math.round(calculated.index)} primary ${calculated.primaryPollutant} (pollutants vector fresh: ${newPollutants.length}) [index ${indexProvider}] [${comparisonLog}] [metadata: ${metadataProviderName ? "providerName spliced" : "unchanged"}]`,
+        };
+    } catch (error) {
+        return { body: null, log: `WK3 aqFill: skipped (${error?.message ?? error})` };
+    }
+}
+
+/**
+ * WK3 AQ 补槽的 append-and-repoint 构造器（overlayWK3AQ 的缺槽版）。
+ * 与 overlayWK3AQ 的区别：没有原 AQ 表可复用，故新 AQ 表按固定布局自建
+ * （见 calculateWK3AQFillSlot0 的函数注释），新根表 = 原根表 + 4 字节
+ * （slot 0 字段追加在表尾），元数据模板取同体其他槽的元数据表。
+ * 其余与 overlayWK3AQ 一致：其余槽位按原始字节保留、重算指向 blob；
+ * 污染物向量在表之前（beta10 教训：元素偏移必须为无符号前向小正数）；
+ * 自检用新包体重建 ByteBuffer，任一不符即放弃、原样返回。
+ * @param {import("flatbuffers").ByteBuffer} ByteBuffer - 已按 rawBody 建好的 ByteBuffer
+ * @param {Uint8Array} rawBody - 原始包体（slot 0 缺失）
+ * @param {string} country - 请求的 country 参数（仅记日志用，门由调用方把关）
+ * @param {number} newCategory - 新 AQ 档位
+ * @param {number} newIndex - 新 AQ 指数
+ * @param {any} options - { scale, primaryEnum, isSignificant, pollutants, comparisonByte, metadataProviderName }
+ * @returns {{body: Uint8Array | null, log: string}}
+ */
+function overlayWK3AQFill(ByteBuffer, rawBody, country, newCategory, newIndex, options = {}) {
+    try {
+        const rootPos = ByteBuffer.readInt32(ByteBuffer.position()) + ByteBuffer.position();
+        if (rootPos < 0 || rootPos + 4 > rawBody.length) return { body: null, log: "WK3 aqFillOverlay: skipped (root out of range)" };
+        const rootVtablePos = rootPos - ByteBuffer.readInt32(rootPos);
+        const rootVtableLen = ByteBuffer.readUint16(rootVtablePos);
+        const rootTableSize = ByteBuffer.readUint16(rootVtablePos + 2);
+        const rootFieldCount = Math.floor((rootVtableLen - 4) / 2);
+        if (rootFieldCount !== 15 || rootTableSize <= 0 || rootTableSize > 1024) {
+            return { body: null, log: `WK3 aqFillOverlay: skipped (unexpected root fields=${rootFieldCount} size=${rootTableSize})` };
+        }
+        if (ByteBuffer.__offset(rootPos, 4)) return { body: null, log: "WK3 aqFillOverlay: skipped (slot 0 present)" };
+        // 原有在场槽位清单（自检用，slot 0 不在其中）。
+        const presentSlots = [];
+        for (let slot = 0; slot < rootFieldCount; slot++) {
+            if (ByteBuffer.__offset(rootPos, 4 + slot * 2)) presentSlots.push(slot);
+        }
+        const want = options.pollutants;
+        if (!Array.isArray(want) || want.length === 0 || want.length > 20) {
+            return { body: null, log: "WK3 aqFillOverlay: skipped (pollutants missing)" };
+        }
+        for (const p of want) {
+            if (!Number.isInteger(p.typeEnum) || p.typeEnum < 0 || p.typeEnum > 13 || !Number.isFinite(p.amount) || p.amount < 0 || !Number.isInteger(p.unitsEnum) || p.unitsEnum < 0 || p.unitsEnum > 3) {
+                return { body: null, log: "WK3 aqFillOverlay: skipped (pollutant entry invalid)" };
+            }
+        }
+        const newScale = typeof options.scale === "string" && options.scale.length > 0 ? options.scale : null;
+        if (!newScale) return { body: null, log: "WK3 aqFillOverlay: skipped (scale missing)" };
+        const isSignificant = options.isSignificant === true;
+        const hasComparison = Number.isInteger(options.comparisonByte);
+        const hasProviderName = typeof options.metadataProviderName === "string" && options.metadataProviderName.length > 0;
+        // 元数据模板：按 1,2,3,4,6,7,14,9 顺序找第一个带元数据的槽；
+        // 只照抄其表形态与标量，不编造来源字符串。
+        let metaTemplate = null;
+        for (const slot of [1, 2, 3, 4, 6, 7, 14, 9]) {
+            const slotOffset = ByteBuffer.__offset(rootPos, 4 + slot * 2);
+            if (!slotOffset) continue;
+            const tablePos = ByteBuffer.__indirect(rootPos + slotOffset);
+            const metaOffset = ByteBuffer.__offset(tablePos, 4);
+            if (!metaOffset) continue;
+            const metaPos = ByteBuffer.__indirect(tablePos + metaOffset);
+            const metaVtablePos = metaPos - ByteBuffer.readInt32(metaPos);
+            const metaVtableLen = ByteBuffer.readUint16(metaVtablePos);
+            const metaTableSize = ByteBuffer.readUint16(metaVtablePos + 2);
+            const metaFieldCount = Math.floor((metaVtableLen - 4) / 2);
+            if (metaFieldCount < 7 || metaTableSize <= 0 || metaTableSize > 256) continue;
+            const stringTargets = {};
+            for (const f of [0, 2, 5]) {
+                const fo = ByteBuffer.__offset(metaPos, 4 + f * 2);
+                if (fo) stringTargets[f] = { fieldOffset: fo, origTarget: ByteBuffer.__indirect(metaPos + fo) };
+            }
+            metaTemplate = {
+                slot,
+                table: rawBody.subarray(metaPos, metaPos + metaTableSize),
+                vtable: rawBody.subarray(metaVtablePos, metaVtablePos + metaVtableLen),
+                vtableLen: metaVtableLen,
+                tableSize: metaTableSize,
+                stringTargets,
+                providerFieldOffset: ByteBuffer.__offset(metaPos, 16),
+            };
+            break;
+        }
+        if (!metaTemplate) return { body: null, log: "WK3 aqFillOverlay: skipped (no metadata template)" };
+        // 模板已有 providerName 字段时重指向新串；没有时表尾追加 4 字节补位。
+        const metaExtendsTable = hasProviderName && !metaTemplate.providerFieldOffset;
+        const newMetaTableSize = metaTemplate.tableSize + (metaExtendsTable ? 4 : 0);
+        const newMetaProviderFieldOffset = metaTemplate.providerFieldOffset || metaTemplate.tableSize;
+        const align4 = value => Math.ceil(value / 4) * 4;
+        const align8 = value => Math.ceil(value / 8) * 8;
+        // 新 AQ 表固定布局（表长 24，vtable 20 字节、8 字段全在表内）：
+        // f7 scale @4、f6 主污染物 @8、f3 是否显著 @9（仅 true 时在表）、
+        // f5 昨日对比 @10（仅算出时在表）、f1 档位 @11、f2 指数 int16 @12、
+        // f4 污染物向量 @16、f0 元数据 @20。
+        const AQ_VTABLE_LEN = 20;
+        const AQ_TABLE_SIZE = 24;
+        const newRootVtablePos = 4;
+        const newRootPos = align4(newRootVtablePos + rootVtableLen);
+        const newAqVtablePos = align4(newRootPos + rootTableSize + 4);
+        const newAqPos = newAqVtablePos + AQ_VTABLE_LEN;
+        const newScaleBytes = new TextEncoder().encode(newScale);
+        const newScalePos = align4(newAqPos + AQ_TABLE_SIZE);
+        const newScaleSize = align4(4 + newScaleBytes.length);
+        let cursor = newScalePos + newScaleSize;
+        const newMetaVtablePos = align4(cursor);
+        cursor = newMetaVtablePos + metaTemplate.vtableLen;
+        const newMetaPos = align8(cursor);
+        cursor = newMetaPos + newMetaTableSize;
+        const providerNameBytes = hasProviderName ? new TextEncoder().encode(options.metadataProviderName) : null;
+        const newProviderNamePos = hasProviderName ? align4(cursor) : null;
+        if (hasProviderName) cursor = newProviderNamePos + align4(4 + providerNameBytes.length);
+        // 污染物向量必须在表之前（beta10 教训）；元素共用一张 vtable。
+        const newPolVecPos = align4(cursor);
+        cursor = newPolVecPos + 4 + want.length * 4;
+        const newPolVtablePos = align4(cursor);
+        cursor = newPolVtablePos + 10;
+        const newPolTablePositions = [];
+        for (let i = 0; i < want.length; i++) {
+            const tablePos = align4(cursor);
+            newPolTablePositions.push(tablePos);
+            cursor = tablePos + 16;
+        }
+        const blobOffset = align8(cursor);
+        const out = new Uint8Array(blobOffset + rawBody.length);
+        const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+        view.setUint32(0, newRootPos, true);
+        // 新根表 vtable：照抄原 vtable，只改两处——表长 +4、entry0 = 原表长。
+        const newRootVtable = new Uint8Array(rawBody.subarray(rootVtablePos, rootVtablePos + rootVtableLen));
+        const newRootVtableView = new DataView(newRootVtable.buffer, newRootVtable.byteOffset, newRootVtable.byteLength);
+        newRootVtableView.setUint16(2, rootTableSize + 4, true);
+        newRootVtableView.setUint16(4, rootTableSize, true);
+        out.set(newRootVtable, newRootVtablePos);
+        // 新根表：照抄原表 + 4 字节；其余槽重算指向 blob，slot 0 指向新 AQ 表。
+        const newRoot = new Uint8Array(rootTableSize + 4);
+        newRoot.set(rawBody.subarray(rootPos, rootPos + rootTableSize), 0);
+        const newRootView = new DataView(newRoot.buffer, newRoot.byteOffset, newRoot.byteLength);
+        newRootView.setInt32(0, newRootPos - newRootVtablePos, true);
+        for (let slot = 0; slot < rootFieldCount; slot++) {
+            const fieldOffset = ByteBuffer.__offset(rootPos, 4 + slot * 2);
+            if (!fieldOffset) continue;
+            const newFieldPos = newRootPos + fieldOffset;
+            newRootView.setUint32(fieldOffset, ByteBuffer.__indirect(rootPos + fieldOffset) + blobOffset - newFieldPos, true);
+        }
+        newRootView.setUint32(rootTableSize, newAqPos - (newRootPos + rootTableSize), true);
+        out.set(newRoot, newRootPos);
+        // 新 AQ vtable：20 字节，8 字段全在表内（无尾部 0 表项）。
+        const newAqVtable = new Uint8Array(AQ_VTABLE_LEN);
+        const newAqVtableView = new DataView(newAqVtable.buffer, newAqVtable.byteOffset, newAqVtable.byteLength);
+        newAqVtableView.setUint16(0, AQ_VTABLE_LEN, true);
+        newAqVtableView.setUint16(2, AQ_TABLE_SIZE, true);
+        const aqEntries = [20, 11, 12, isSignificant ? 9 : 0, 16, hasComparison ? 10 : 0, 8, 4];
+        aqEntries.forEach((entry, i) => newAqVtableView.setUint16(4 + i * 2, entry, true));
+        out.set(newAqVtable, newAqVtablePos);
+        // 新 AQ 表。
+        const newAq = new Uint8Array(AQ_TABLE_SIZE);
+        const newAqView = new DataView(newAq.buffer, newAq.byteOffset, newAq.byteLength);
+        newAqView.setInt32(0, newAqPos - newAqVtablePos, true);
+        newAqView.setUint32(4, newScalePos - (newAqPos + 4), true);
+        newAqView.setInt8(8, options.primaryEnum);
+        newAqView.setInt8(9, isSignificant ? 1 : 0);
+        newAqView.setInt8(10, hasComparison ? options.comparisonByte : 0);
+        newAqView.setInt8(11, newCategory);
+        newAqView.setInt16(12, newIndex, true);
+        newAqView.setUint32(16, newPolVecPos - (newAqPos + 16), true);
+        newAqView.setUint32(20, newMetaPos - (newAqPos + 20), true);
+        out.set(newAq, newAqPos);
+        // 新 scale 串。
+        view.setUint32(newScalePos, newScaleBytes.length, true);
+        out.set(newScaleBytes, newScalePos + 4);
+        // 新元数据：照抄模板表；字符串字段 0/2/5 重指向 blob；
+        // providerName 字段重指向新串（模板无此字段时为表尾追加位）。
+        out.set(metaTemplate.vtable, newMetaVtablePos);
+        if (metaExtendsTable) {
+            const metaVtableView = new DataView(out.buffer, out.byteOffset + newMetaVtablePos, metaTemplate.vtableLen);
+            metaVtableView.setUint16(2, newMetaTableSize, true);
+            metaVtableView.setUint16(4 + 6 * 2, metaTemplate.tableSize, true);
+        }
+        out.set(metaTemplate.table, newMetaPos);
+        const metaView = new DataView(out.buffer, out.byteOffset + newMetaPos, newMetaTableSize);
+        metaView.setInt32(0, newMetaPos - newMetaVtablePos, true);
+        for (const f of [0, 2, 5]) {
+            const entry = metaTemplate.stringTargets[f];
+            if (entry) metaView.setUint32(entry.fieldOffset, entry.origTarget + blobOffset - (newMetaPos + entry.fieldOffset), true);
+        }
+        if (hasProviderName) {
+            metaView.setUint32(newMetaProviderFieldOffset, newProviderNamePos - (newMetaPos + newMetaProviderFieldOffset), true);
+            view.setUint32(newProviderNamePos, providerNameBytes.length, true);
+            out.set(providerNameBytes, newProviderNamePos + 4);
+        }
+        // 污染物向量 + 元素表（共用一张 vtable，形态与 overlay fresh 分支一致）。
+        const freshVtable = new Uint8Array([10, 0, 16, 0, 4, 0, 8, 0, 12, 0]);
+        out.set(freshVtable, newPolVtablePos);
+        want.forEach((p, i) => {
+            const tablePos = newPolTablePositions[i];
+            const tableView = new DataView(out.buffer, out.byteOffset + tablePos, 16);
+            tableView.setInt32(0, tablePos - newPolVtablePos, true);
+            tableView.setInt8(4, p.typeEnum);
+            tableView.setFloat32(8, p.amount, true);
+            tableView.setInt8(12, p.unitsEnum);
+        });
+        view.setUint32(newPolVecPos, want.length, true);
+        want.forEach((p, i) => {
+            const elemPos = newPolVecPos + 4 + i * 4;
+            view.setUint32(elemPos, newPolTablePositions[i] - elemPos, true);
+        });
+        out.set(rawBody, blobOffset);
+        // 自检：重建 ByteBuffer 核对关键项。
+        const checkBuffer = new flatbuffers.ByteBuffer(out);
+        const checkRootPos = checkBuffer.readInt32(checkBuffer.position()) + checkBuffer.position();
+        const checkRootVtablePos = checkRootPos - checkBuffer.readInt32(checkRootPos);
+        const checkFieldCount = Math.floor((checkBuffer.readUint16(checkRootVtablePos) - 4) / 2);
+        if (checkFieldCount !== rootFieldCount) return { body: null, log: "WK3 aqFillOverlay: skipped (self-check root field count mismatch)" };
+        if (checkBuffer.readUint16(checkRootVtablePos + 2) !== rootTableSize + 4) return { body: null, log: "WK3 aqFillOverlay: skipped (self-check root table size mismatch)" };
+        if (checkBuffer.readUint16(checkRootVtablePos + 4) !== rootTableSize) return { body: null, log: "WK3 aqFillOverlay: skipped (self-check root slot 0 vtable entry mismatch)" };
+        for (const slot of presentSlots) {
+            if (!checkBuffer.__offset(checkRootPos, 4 + slot * 2)) return { body: null, log: `WK3 aqFillOverlay: skipped (self-check slot ${slot} lost)` };
+        }
+        const checkAqPos = checkBuffer.__indirect(checkRootPos + checkBuffer.__offset(checkRootPos, 4));
+        const checkAqVtablePos = checkAqPos - checkBuffer.readInt32(checkAqPos);
+        if (checkBuffer.readUint16(checkAqVtablePos) !== AQ_VTABLE_LEN) return { body: null, log: "WK3 aqFillOverlay: skipped (self-check AQ vtable length mismatch)" };
+        if (checkBuffer.readInt8(checkAqPos + checkBuffer.__offset(checkAqPos, 6)) !== newCategory) {
+            return { body: null, log: "WK3 aqFillOverlay: skipped (self-check category mismatch)" };
+        }
+        if (checkBuffer.readInt16(checkAqPos + checkBuffer.__offset(checkAqPos, 8)) !== newIndex) {
+            return { body: null, log: "WK3 aqFillOverlay: skipped (self-check index mismatch)" };
+        }
+        if (checkBuffer.__string(checkAqPos + checkBuffer.__offset(checkAqPos, 18)) !== newScale) {
+            return { body: null, log: "WK3 aqFillOverlay: skipped (self-check scale mismatch)" };
+        }
+        if (hasComparison) {
+            const checkComparisonOffset = checkBuffer.__offset(checkAqPos, 14);
+            if (!checkComparisonOffset || checkBuffer.readInt8(checkAqPos + checkComparisonOffset) !== options.comparisonByte) {
+                return { body: null, log: "WK3 aqFillOverlay: skipped (self-check comparison mismatch)" };
+            }
+        }
+        if (hasProviderName) {
+            const checkMetaPos = checkBuffer.__indirect(checkAqPos + checkBuffer.__offset(checkAqPos, 4));
+            const checkMetaProviderOffset = checkBuffer.__offset(checkMetaPos, 16);
+            if (!checkMetaProviderOffset || checkBuffer.__string(checkMetaPos + checkMetaProviderOffset) !== options.metadataProviderName) {
+                return { body: null, log: "WK3 aqFillOverlay: skipped (self-check metadata providerName mismatch)" };
+            }
+        }
+        const checkVecPos = checkBuffer.__indirect(checkAqPos + checkBuffer.__offset(checkAqPos, 12));
+        if (checkBuffer.readInt32(checkVecPos) !== want.length) {
+            return { body: null, log: "WK3 aqFillOverlay: skipped (self-check pollutants vector length mismatch)" };
+        }
+        // 无符号前向检查：元素偏移必须为小正数且界内，否则苹果原生
+        // 解析越界（JS 有符号读回会掩盖此问题，beta10 即因此漏网）。
+        for (let i = 0; i < want.length; i++) {
+            const rawOffset = checkBuffer.readUint32(checkVecPos + 4 + i * 4);
+            if (rawOffset <= 0 || rawOffset >= out.length) {
+                return { body: null, log: "WK3 aqFillOverlay: skipped (self-check pollutants element offset not forward)" };
+            }
+        }
+        for (let i = 0; i < want.length; i++) {
+            const elem = checkBuffer.__indirect(checkVecPos + 4 + i * 4);
+            const p = want[i];
+            if (checkBuffer.readInt8(elem + checkBuffer.__offset(elem, 4)) !== p.typeEnum) {
+                return { body: null, log: "WK3 aqFillOverlay: skipped (self-check pollutant type mismatch)" };
+            }
+            if (checkBuffer.readFloat32(elem + checkBuffer.__offset(elem, 6)) !== Math.fround(p.amount)) {
+                return { body: null, log: "WK3 aqFillOverlay: skipped (self-check pollutant amount mismatch)" };
+            }
+            if (checkBuffer.readInt8(elem + checkBuffer.__offset(elem, 8)) !== p.unitsEnum) {
+                return { body: null, log: "WK3 aqFillOverlay: skipped (self-check pollutant units mismatch)" };
+            }
+        }
+        return { body: out, log: `WK3 aqFillOverlay: slot 0 created scale ${newScale}, category ${newCategory} index ${newIndex} (append-and-repoint, opaque slots preserved, pollutants vector fresh) body ${rawBody.length}->${out.length}` };
+    } catch (error) {
+        return { body: null, log: `WK3 aqFillOverlay: skipped (${error?.message ?? error})` };
+    }
+}
+
 
 function replaceWK3CWTemperature(ByteBuffer, rawBody, country, providerName, providerCurrentWeather) {
     try {
