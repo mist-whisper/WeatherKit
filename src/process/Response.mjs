@@ -179,42 +179,52 @@ export async function Response($request, $response) {
                                     workingBody = hourlyReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
-                                // 未来一小时移植对照 v2（WK3 3.5.0-beta3）：修正版东京槽 5
-                                // 移植 + 请求坐标（与 beta2 完全一致），再加单变量对照：
-                                // 只把根表重建成规范布局（rebuildWK3RootCanonical，自写，
-                                // 不引用外部代码；§257）。NH 表与各子表字节不变，只有
-                                // 根表布局从尾巴追加改成规范偏移。beta2 体被拒、beta3 若
-                                // 被接受，说明根表布局就是问题；若仍被拒，根表布局不是
-                                // 问题，矛头转向内容错配。
-                                // 移植（FIX1+FIX2）+ 请求坐标写进 NH 元数据。§195 已证实
-                                // 修正版移植（AQ 元数据经纬度）上机仍被拒，存在性本身是
-                                // breaker（对 CN 城市）；本次单变量只改经纬度来源（请求
-                                // 坐标 parameters.latitude/longitude），其余与 3.4.2-beta1
-                                // 的 transplantWK3NextHourFixed 完全一致。只在
+                                // 未来一小时填空 + 规范根表（WK3 3.5.0-beta4）：供应商
+                                // 现编 NH 表 + 规范根表重建（自写，不引用外部代码；§263
+                                // 路 B + 路 A 的干净测试）。这是 2×2 的最后一格：
+                                //   根表：尾巴追加（beta4-2026-11-05、beta2） vs 规范（beta3）
+                                //   NH 内容：供应商现编（beta4-2026-11-05） vs 东京移植（beta2/beta3）
+                                //   规范根表 + 供应商现编 从未测过。本 beta 补这一格。
+                                // fillWK3NextHour（3.4.1-beta8 同款，自写）按彩云 Minutely
+                                // 为请求城市现编 NH 表（分钟/摘要/条件/元数据，提供方
+                                // 彩云天气，窗口移至今）；再经 rebuildWK3RootCanonical
+                                // （beta3 同款，自写）把根表重建成规范布局。只在
                                 // forecastNextHour 在 dataSets 且国家在 Replace 时跑；
-                                // 任一失败原样返回，不影响其他槽。面板若出现，显示的是
-                                // 东京的雨（对照本意，不是 bug）。
+                                // 任一失败原样返回，不影响其他槽。日志附供应商雨况
+                                // （rainyMinutes/maxIntensity/firstToken），以便确认
+                                // 供应商确实报雨（干净测试的前提）；面板若出现，显示
+                                // 的是供应商给该城市的雨。
                                 let nhReplace = { body: null, log: "WK3 nh: skipped (not attempted)" };
                                 if (parameters.dataSets.includes("forecastNextHour") && Settings?.Weather?.Replace?.includes(parameters.country)) {
                                     try {
-                                        const reqLat = Number(parameters.latitude);
-                                        const reqLon = Number(parameters.longitude);
-                                        if (!Number.isFinite(reqLat) || !Number.isFinite(reqLon)) {
-                                            nhReplace = { body: null, log: "WK3 nh: skipped (request lat/lon absent)" };
+                                        const nhEnv = {
+                                            colorfulClouds: new ColorfulClouds({ ...parameters }, Settings?.API?.ColorfulClouds?.Token || "Y2FpeXVuX25vdGlmeQ=="),
+                                            qWeather: new QWeather({ ...parameters }, Settings?.API?.QWeather?.Token || "bdd98ec1d87747f3a2e8b1741a5af796", Settings?.API?.QWeather?.Host),
+                                        };
+                                        const nhData = await InjectForecastNextHour(undefined, Settings, nhEnv);
+                                        if (!nhData) {
+                                            nhReplace = { body: null, log: "WK3 nh: skipped (no provider data)" };
                                         } else {
-                                            nhReplace = transplantWK3NextHourFixed(workingByteBuffer, workingBody, { targetLat: reqLat, targetLon: reqLon });
+                                            const mins = Array.isArray(nhData.minutes) ? nhData.minutes : [];
+                                            const rainyMinutes = mins.filter(m => (m.precipitationIntensity || 0) > 0).length;
+                                            const maxIntensity = mins.reduce((a, m) => Math.max(a, m.precipitationIntensity || 0), 0);
+                                            const firstToken = nhData.condition?.[0]?.forecastToken ?? (rainyMinutes > 0 ? "RAIN" : "CLEAR");
+                                            const rainSummary = `rainyMinutes=${rainyMinutes} maxIntensity=${Number(maxIntensity).toFixed(3)} firstToken=${firstToken}`;
+                                            nhReplace = fillWK3NextHour(workingByteBuffer, workingBody, nhData, { shiftToNow: true });
                                             if (nhReplace.body) {
-                                                // Canonical-root control (beta3, §257): rebuild ONLY the
+                                                // Canonical-root (beta3, §257): rebuild ONLY the
                                                 // root table in canonical layout; NH table and every
-                                                // sub-table stay byte-identical. Single variable vs beta2.
+                                                // sub-table stay byte-identical.
                                                 const canon = rebuildWK3RootCanonical(new flatbuffers.ByteBuffer(nhReplace.body), nhReplace.body);
                                                 if (canon.body) {
-                                                    nhReplace = { body: canon.body, log: `${nhReplace.log} | ${canon.log}` };
+                                                    nhReplace = { body: canon.body, log: `${nhReplace.log} | ${canon.log} | ${rainSummary}` };
                                                 } else {
-                                                    nhReplace = { body: nhReplace.body, log: `${nhReplace.log} | ${canon.log} (kept beta2 tail-append body)` };
+                                                    nhReplace = { body: nhReplace.body, log: `${nhReplace.log} | ${canon.log} (kept fill tail-append body) | ${rainSummary}` };
                                                 }
                                                 workingBody = nhReplace.body;
                                                 workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
+                                            } else {
+                                                nhReplace = { body: null, log: `${nhReplace.log} | ${rainSummary}` };
                                             }
                                         }
                                     } catch (e) {
@@ -3839,9 +3849,16 @@ function fillWK3NextHour(ByteBuffer, rawBody, nh, opts = {}) {
         const md = nh.metadata || {};
 
         // BISECT beta3: shift window to now (provider window starts 60-120s in the past)
+        // beta4 fix: align to the minute boundary (nowFloor), like
+        // transplantWK3NextHourFixed. The provider window is already
+        // minute-aligned (minuteStemp); shifting by nowSec would leave the
+        // window starting mid-minute (nowSec % 60 seconds off), and the
+        // minutes must start at :00. A non-aligned window is a needless
+        // confound for the clean test.
         if (opts.shiftToNow) {
             const nowSec = Math.trunc(Date.now() / 1000);
-            const delta = nowSec - Math.trunc(nh.forecastStart || 0);
+            const nowFloor = nowSec - (nowSec % 60);
+            const delta = nowFloor - Math.trunc(nh.forecastStart || 0);
             if (delta > 0) {
                 nh.forecastStart = Math.trunc(nh.forecastStart || 0) + delta;
                 nh.forecastEnd = Math.trunc(nh.forecastEnd || 0) + delta;
