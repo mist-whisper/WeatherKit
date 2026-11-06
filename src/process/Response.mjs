@@ -179,10 +179,13 @@ export async function Response($request, $response) {
                                     workingBody = hourlyReplace.body;
                                     workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                 }
-                                // 未来一小时移植对照 v2（WK3 3.5.0-beta2）：修正版东京槽 5
-                                // beta2 修正：beta1 的守卫用 Number.isFinite 直接判
-                                // parseWeatherKitURL 返回的字符串经纬度，恒为 false，
-                                // 移植从未执行（§253）；此处先 Number() 再判有限。
+                                // 未来一小时移植对照 v2（WK3 3.5.0-beta3）：修正版东京槽 5
+                                // 移植 + 请求坐标（与 beta2 完全一致），再加单变量对照：
+                                // 只把根表重建成规范布局（rebuildWK3RootCanonical，自写，
+                                // 不引用外部代码；§257）。NH 表与各子表字节不变，只有
+                                // 根表布局从尾巴追加改成规范偏移。beta2 体被拒、beta3 若
+                                // 被接受，说明根表布局就是问题；若仍被拒，根表布局不是
+                                // 问题，矛头转向内容错配。
                                 // 移植（FIX1+FIX2）+ 请求坐标写进 NH 元数据。§195 已证实
                                 // 修正版移植（AQ 元数据经纬度）上机仍被拒，存在性本身是
                                 // breaker（对 CN 城市）；本次单变量只改经纬度来源（请求
@@ -201,6 +204,15 @@ export async function Response($request, $response) {
                                         } else {
                                             nhReplace = transplantWK3NextHourFixed(workingByteBuffer, workingBody, { targetLat: reqLat, targetLon: reqLon });
                                             if (nhReplace.body) {
+                                                // Canonical-root control (beta3, §257): rebuild ONLY the
+                                                // root table in canonical layout; NH table and every
+                                                // sub-table stay byte-identical. Single variable vs beta2.
+                                                const canon = rebuildWK3RootCanonical(new flatbuffers.ByteBuffer(nhReplace.body), nhReplace.body);
+                                                if (canon.body) {
+                                                    nhReplace = { body: canon.body, log: `${nhReplace.log} | ${canon.log}` };
+                                                } else {
+                                                    nhReplace = { body: nhReplace.body, log: `${nhReplace.log} | ${canon.log} (kept beta2 tail-append body)` };
+                                                }
                                                 workingBody = nhReplace.body;
                                                 workingByteBuffer = new flatbuffers.ByteBuffer(workingBody);
                                             }
@@ -3530,6 +3542,89 @@ function transplantWK3NextHourFixed(ByteBuffer, rawBody, opts = {}) {
         return fail(`exception ${e?.message ?? e}`);
     }
 }
+
+// Rebuild the WK3 root table in canonical layout (own implementation, from the
+// FlatBuffers spec; single-variable control for the slot-5 rejection, §257).
+// The input body (e.g. the beta2 transplant output, slot 5 at the tail) keeps
+// every sub-table byte-identical; ONLY the root table is rewritten:
+//   - fresh vtable (4 + fieldCount*2) and fresh root table (4 + fieldCount*4);
+//   - every present field at its canonical offset (4 + i*4);
+//   - absent fields keep vtable entry 0;
+//   - the whole input body is copied verbatim, shifted (8-byte aligned), and
+//     all field uoffsets are recomputed to point into the shifted copy.
+// No code is taken from any outside source; the layout follows from the format
+// (vtable at 4, root after vtable, body shifted, 8-byte alignment).
+// Any failure returns { body: null } (fail-closed; caller keeps the input).
+function rebuildWK3RootCanonical(ByteBuffer, rawBody) {
+    const align4 = (v) => (v + 3) & ~3;
+    const align8 = (v) => (v + 7) & ~7;
+    const fail = (reason) => ({ body: null, log: `WK3 rootCanon: skipped (${reason})` });
+    try {
+        const bb = ByteBuffer;
+        const rootPos = bb.readInt32(bb.position()) + bb.position();
+        const rootVtablePos = rootPos - bb.readInt32(rootPos);
+        const rootVtableLen = bb.readUint16(rootVtablePos);
+        const rootTableSize = bb.readUint16(rootVtablePos + 2);
+        const fieldCount = Math.floor((rootVtableLen - 4) / 2);
+        if (fieldCount < 1 || fieldCount > 64) return fail('fieldCount out of range');
+        if (rootTableSize < 4 || rootTableSize > rawBody.length) return fail('table size out of range');
+        const newVtableLen = 4 + fieldCount * 2;
+        const newTableLen = 4 + fieldCount * 4;
+        const newVtablePos = 4;
+        const newRootPos = align4(newVtablePos + newVtableLen);
+        const shiftedPos = align8(newRootPos + newTableLen);
+        const outLen = shiftedPos + rawBody.length;
+        const out = new Uint8Array(outLen);
+        const od = new DataView(out.buffer);
+        out.set(rawBody, shiftedPos);
+        od.setUint32(0, newRootPos, true);
+        od.setUint16(newVtablePos, newVtableLen, true);
+        od.setUint16(newVtablePos + 2, newTableLen, true);
+        od.setInt32(newRootPos, newRootPos - newVtablePos, true);
+        for (let f = 0; f < fieldCount; f++) {
+            const o = bb.__offset(rootPos, 4 + f * 2);
+            if (!o) continue; // absent field: vtable entry stays 0
+            const newFieldOff = 4 + f * 4;
+            od.setUint16(newVtablePos + 4 + f * 2, newFieldOff, true);
+            const oldFieldAddr = rootPos + o;
+            const oldValue = bb.readUint32(oldFieldAddr);
+            const oldTarget = oldFieldAddr + oldValue;
+            let newValue;
+            if (oldValue && oldTarget > oldFieldAddr && oldTarget < rawBody.length) {
+                const newFieldAddr = newRootPos + newFieldOff;
+                newValue = (shiftedPos + oldTarget) - newFieldAddr;
+            } else {
+                newValue = oldValue; // not a forward pointer (scalar); keep as-is
+            }
+            od.setUint32(newRootPos + newFieldOff, newValue, true);
+        }
+        // self-check: real flatbuffers read-back
+        const chk = new flatbuffers.ByteBuffer(out);
+        const chkRoot = chk.readInt32(chk.position()) + chk.position();
+        const chkRootVt = chkRoot - chk.readInt32(chkRoot);
+        if (chk.readUint16(chkRootVt) !== newVtableLen) return fail('self-check vtable length');
+        if (chk.readUint16(chkRootVt + 2) !== newTableLen) return fail('self-check table size');
+        for (let f = 0; f < fieldCount; f++) {
+            const oOrig = bb.__offset(rootPos, 4 + f * 2);
+            const oNew = chk.__offset(chkRoot, 4 + f * 2);
+            if (!oOrig) { if (oNew) return fail(`self-check field ${f} should be absent`); continue; }
+            if (oNew !== 4 + f * 4) return fail(`self-check field ${f} not canonical`);
+            const tOrig = bb.__indirect(rootPos + oOrig);
+            const tNew = chk.__indirect(chkRoot + oNew);
+            const vtOrig = tOrig - bb.readInt32(tOrig);
+            const vtNew = tNew - chk.readInt32(tNew);
+            if (bb.readUint16(vtOrig) !== chk.readUint16(vtNew)) return fail(`self-check field ${f} sub-table vtable length changed`);
+            if (bb.readUint16(vtOrig + 2) !== chk.readUint16(vtNew + 2)) return fail(`self-check field ${f} sub-table size changed`);
+        }
+        return {
+            body: out,
+            log: `WK3 rootCanon: root rebuilt canonical (fields=${fieldCount} table ${rootTableSize}->${newTableLen}) body ${rawBody.length}->${outLen}`,
+        };
+    } catch (e) {
+        return fail(`exception ${e?.message ?? e}`);
+    }
+}
+
 function transplantWK3NextHour(ByteBuffer, rawBody) {
     const fail = (reason) => ({ body: null, log: `WK3 nhTransplant: skipped (${reason})` });
     try {
